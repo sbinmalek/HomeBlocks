@@ -124,7 +124,6 @@ jobs:
         testing: 'False'
         path: import/nuraft_mesg
         key_prefix: NuMesgDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}
-        fail_on_cache_miss: true
       if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
 
     - name: Retrieve Dependencies HomeStore
@@ -141,7 +140,6 @@ jobs:
         testing: 'False'
         path: import/homestore
         key_prefix: HomestoreDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-False
-        fail_on_cache_miss: true
       if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
 
 
