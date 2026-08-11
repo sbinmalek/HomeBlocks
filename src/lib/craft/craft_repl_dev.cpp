@@ -18,7 +18,26 @@
 
 #include <homestore/logstore/log_store.hpp> // home_log_store, logstore_seq_num_t
 
+#include <optional>
+#include <unordered_set>
+#include <vector>
+
 namespace homeblocks {
+
+namespace {
+// fetch_data's contract is one entry per requested LSN (never one that wasn't asked for, never
+// repeated). Returns the first response LSN that violates it (unrequested or duplicated), or nullopt if
+// every entry matches exactly one requested LSN. Erasing from `pending` as we go catches duplicates for
+// free: a repeated lsn finds nothing left to erase the second time.
+std::optional< int64_t > validate_fetch_response(std::vector< int64_t > const& requested,
+                                                  std::vector< JournalSlot > const& response) {
+    std::unordered_set< int64_t > pending{requested.begin(), requested.end()};
+    for (auto const& slot : response) {
+        if (pending.erase(slot.lsn) == 0) return slot.lsn;
+    }
+    return std::nullopt;
+}
+} // namespace
 
 // ─── HomeStore journal backend ────────────────────────────────────────────────
 //
@@ -278,6 +297,12 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
         }
         // apply_sync_rs_commit_lsn co_awaits peer fetch + journal writes; on_commit itself is a synchronous
         // HomeStore callback, so fire-and-forget it.
+        //
+        // FIXME: KNOWN GAP (not yet fixed): this coroutine captures only the raw `owner_` pointer, not anything
+        // that keeps CraftReplDev alive. If the object is destroyed (e.g. volume removal) while this
+        // coroutine is suspended inside fetch_from_peer()/write_slot(), it resumes into freed memory --
+        // use-after-free. Two possible fixes:
+        //   Check comments: https://github.com/sbinmalek/HomeBlocks/pull/2#discussion_r3761568811
         detail::detach(owner_->apply_sync_rs_commit_lsn(payload->rs_commit_lsn, payload->client_token,
                                                         std::move(*empty_slots)));
         break;
@@ -296,14 +321,31 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
 //
 // apply_sync_rs_commit_lsn (22886): client_token is verified against the current session first -- a mismatch
 // gates the ENTIRE apply (no reconciliation, no catch-up, no watermark advance), since a RAFT entry whose
-// token doesn't match the live session shouldn't be trusted to describe it. Once the token matches, every
+// token doesn't match the live session shouldn't be trusted to describe it. empty_slots is range-checked
+// against rs_commit_lsn next, for the same reason and with the same all-or-nothing gate: SyncRSCommitLSN
+// verdicts are only ever defined for slots the leader pre-resolved up to rs_commit_lsn (S5), so a negative
+// or out-of-range entry is a malformed/corrupt RAFT entry, not a legitimate verdict -- trusting it would
+// permanently poison empty_lsns_ for a slot that hasn't even been reached yet. Once both checks pass, every
 // other step is best-effort forward progress: empty_slots are reconciled and the newly-spanned range is
 // marked missing, catch-up attempts to fill in what it can from a peer, and commit_lsn/last_append_lsn
 // advance regardless of whether catch-up fully succeeded -- mirroring truncate()'s invariant that apply
-// never reverts the watermark, only advances it.
+// never reverts the watermark, only advances it. A peer's fetch_data response gets its own all-or-nothing
+// check (validate_fetch_response): unlike the two checks above, this one can't gate the whole apply (gap
+// marking and last_append_lsn already advanced by the time the response arrives), so a malformed response
+// is instead treated exactly like a failed fetch -- none of it applied, everything requested stays missing.
 
 async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint64_t client_token,
                                                     std::vector< int64_t > empty_slots) {
+    // Validated before any state is touched -- same all-or-nothing gate as the token check below, since an
+    // out-of-range verdict means the entry itself cannot be trusted, not that this one slot should be skipped.
+    for (int64_t lsn : empty_slots) {
+        if (lsn < 0 || lsn > rs_commit_lsn) {
+            LOGE("apply_sync_rs_commit_lsn: empty_slots lsn={} out of range [0, {}] -- rejecting entire apply",
+                lsn, rs_commit_lsn);
+            co_return std::unexpected(make_error_condition(volume_error::INVALID_ENTRY));
+        }
+    }
+
     std::vector< int64_t > to_fetch;
     {
         std::lock_guard lk{missing_mu_};
@@ -337,6 +379,14 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
         } else if (auto fetched = co_await peer_fetcher_->fetch_from_peer(to_fetch); !fetched) {
             LOGE("apply_sync_rs_commit_lsn: fetch_from_peer failed: {} -- leaving {} lsn(s) as missing",
                 fetched.error().message(), to_fetch.size());
+        } else if (auto bad_lsn = validate_fetch_response(to_fetch, *fetched); bad_lsn) {
+            // fetch_data's contract is one entry per requested LSN (never one we didn't ask for, never
+            // repeated) -- any deviation means the response itself can't be trusted, so none of it is
+            // applied (same outcome as a fetch failure) rather than cherry-picking the entries that look
+            // fine from a peer that has already proven unreliable.
+            LOGE("apply_sync_rs_commit_lsn: peer response lsn={} not requested (or duplicated) -- rejecting "
+                 "entire batch, leaving {} lsn(s) as missing",
+                *bad_lsn, to_fetch.size());
         } else {
             for (auto& slot : *fetched) {
                 if (slot.is_empty) {
