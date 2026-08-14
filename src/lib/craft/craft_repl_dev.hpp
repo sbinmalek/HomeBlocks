@@ -164,10 +164,8 @@ public:
 
     // ── internal / peer API (server-to-server; NEVER reachable over the client wire) ──
 
-    // Return {commit_lsn, last_append_lsn} for the local partition.
-    async_result< craft::lsn_pair > get_lsns(volume_id_t vol_id);
-
-    // Alias of get_lsns exposed to peer servers during GetRSCommitLSN broadcast.
+    // Return {commit_lsn, last_append_lsn} for the local partition. Exposed to peer servers
+    // during the GetRSCommitLSN broadcast.
     async_result< craft::lsn_pair > get_rs_commit_lsn();
 
     // Drop all journal entries with dLSN > lsn; clear missing-set entries above lsn; clamp last_append_lsn.
@@ -301,8 +299,11 @@ private:
     volume_id_t vol_id_;
     unique< CraftJournalBackend > journal_;
     CraftPartitionState state_;
+    // TODO: Can this be replaced with boost::icl::interval_set? Particularly helpful when a write
+    // comes in with a huge gap -- gap-fill loops (write(), apply_sync_rs_commit_lsn()) currently
+    // insert one LSN at a time under missing_mu_, which is O(gap width) instead of O(log ranges).
     std::set< int64_t > missing_lsns_; // gaps between commit_lsn and last_append_lsn
-    std::set< int64_t > empty_lsns_;   // slots positively verdicted Empty by a prior SyncRSCommitLSN (S5)
+    std::unordered_set< int64_t > empty_lsns_;   // slots positively verdicted Empty by a prior SyncRSCommitLSN (S5)
     mutable std::mutex missing_mu_;    // guards state_, missing_lsns_, and empty_lsns_
     bool login_in_progress_{false};
     std::mutex login_mu_;
