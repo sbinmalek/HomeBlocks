@@ -83,13 +83,22 @@ public:
 // Tests inject MockCraftJournalBackend directly.
 unique< CraftJournalBackend > make_homestore_journal_backend(shared< homestore::home_log_store > logstore);
 
-// ─── CraftPeerFetcher ─────────────────────────────────────────────────────────
+// ─── CraftPeerChannel ─────────────────────────────────────────────────────────
 //
-// Abstraction over the server-to-server fetch_data() call. Injected into
-// CraftReplDev so unit tests can stub peer communication without a live network.
-// Production wires CraftConnector (S9). Default (null) leaves catch-up stubbed.
+// Abstraction over the server-to-server fetch_data() calls this backend needs, for two distinct purposes:
+// single-peer catch-up (fetch_from_peer, used by apply_sync_rs_commit_lsn on every replica after a RAFT
+// commit -- best-effort, non-gating) and leader-side quorum broadcast (fetch_from_quorum, used by
+// pre_resolve_slots before proposing a SyncRSCommitLSN entry -- must gate the proposal, so an unwired
+// channel fails closed instead). Injected into CraftReplDev so unit tests can stub peer communication
+// without a live network. Production wires CraftConnector (S9). Default (null) leaves both paths stubbed.
 
-class CraftPeerFetcher {
+// One replica-set member's fetch_data-shaped reply to a pre-resolution broadcast. JournalSlot's existing
+// four-way per-LSN contract (is_empty / present+data / present+zero / omitted-not-held-here) applies as-is.
+struct QuorumSlotResponse {
+    std::vector< JournalSlot > slots;
+};
+
+class CraftPeerChannel {
 public:
     // `timeout_ms` is the deadline this call must complete within (CraftReplDev passes
     // peer_fetch_timeout_ms_, set from home_blks_config.fbs's peer_fetch_timeout_ms). A real transport
@@ -98,7 +107,15 @@ public:
     // direct function calls (production is unwired, tests call synchronously).
     virtual async_result< std::vector< JournalSlot > > fetch_from_peer(std::vector< int64_t > lsns,
                                                                         uint32_t timeout_ms) = 0;
-    virtual ~CraftPeerFetcher() = default;
+
+    // Broadcasts fetch_data(lsns) to every responding replica-set member; a non-responding member is simply
+    // absent from the result. Deliberately no replica-set-size / majority-count method: the contract is
+    // "trust whichever subset of members responded" -- there is no replica-set membership concept anywhere
+    // in this backend yet (S8/S9/S10 territory), so this interface can't offer one either.
+    virtual async_result< std::vector< QuorumSlotResponse > > fetch_from_quorum(std::vector< int64_t > lsns,
+                                                                                 uint32_t timeout_ms) = 0;
+
+    virtual ~CraftPeerChannel() = default;
 };
 
 // ─── CraftReplDev ─────────────────────────────────────────────────────────────
@@ -112,6 +129,8 @@ class CraftReplDev : public std::enable_shared_from_this< CraftReplDev > {
     // Lets test_craft_raft_entries.cpp call apply_sync_rs_commit_lsn (private) directly, so it can assert
     // on the exact result rather than only on-commit's discarded fire-and-forget outcome.
     friend class CraftRaftEntriesTest;
+    // Lets test_craft_pre_resolution.cpp call pre_resolve_slots (private) directly -- same reasoning.
+    friend class CraftPreResolutionTest;
 #endif
 
     // Private -- see create() below. shared_from_this() (used by apply_sync_rs_commit_lsn's detached
@@ -227,11 +246,14 @@ public:
         return state_.term;
     }
 
-    // Wires the server-to-server peer channel used by apply_sync_rs_commit_lsn catch-up.
-    // Called by CraftConnector (S9) after construction; tests inject a mock.
-    void set_peer_fetcher(CraftPeerFetcher* f) { peer_fetcher_ = f; }
+    // Wires the server-to-server peer channel used by apply_sync_rs_commit_lsn's catch-up and
+    // pre_resolve_slots's quorum broadcast. Called by CraftConnector (S9) after construction; tests inject
+    // a mock. Left null: apply_sync_rs_commit_lsn's catch-up degrades to best-effort (logs and leaves the
+    // lsn missing); pre_resolve_slots fails closed (std::errc::not_supported) instead of silently
+    // under-resolving.
+    void set_peer_channel(CraftPeerChannel* c) { peer_channel_ = c; }
 
-    // Overrides the deadline passed to fetch_from_peer (default mirrors home_blks_config.fbs).
+    // Overrides the deadline passed to fetch_from_peer/fetch_from_quorum (default mirrors home_blks_config.fbs).
     // Production sets this from HB_DYNAMIC_CONFIG(peer_fetch_timeout_ms) after construction (S8/S9).
     void set_peer_fetch_timeout_ms(uint32_t ms) { peer_fetch_timeout_ms_ = ms; }
 
@@ -307,6 +329,26 @@ private:
         CraftReplDev* owner_;
     };
 
+    // LEADER-only (S5 / SDSTOR-22907). Resolves every slot <= upto not yet confirmed present or Empty by THIS
+    // leader: a known gap in missing_lsns_, or a slot beyond this leader's own last_append_lsn that upto reaches
+    // past (never even opened as a gap -- e.g. a client Resolve naming a dLSN this leader never itself received,
+    // or a login rs_commit_lsn that is the QUORUM's max, not this replica's own). For each: fetch from the
+    // quorum; any responding member reporting is_empty=true wins that slot; a slot no responding member reports
+    // data or Empty for is quorum-lacks-evidence, minted fresh as Empty; a slot some responding member has real
+    // data for is written into this leader's own journal so it can also correctly serve fetch_data() to others.
+    //
+    // Returns every slot <= upto now verdicted Empty (freshly minted or inherited) -- NOT a full per-slot outcome
+    // report. A slot whose local journal write fails after a successful quorum fetch is left out of BOTH the
+    // return value and missing_lsns_/empty_lsns_ (best-effort per-slot, same posture as apply_sync_rs_commit_lsn's
+    // own catch-up). The caller (append()/request_resolution(), SDSTOR-22908) MUST treat "still missing" as "not
+    // yet safe to propose past this slot", independent of whether the overall async_result succeeded.
+    //
+    // Fails closed (no partial resolution) if peer_channel_ is unset or the broadcast itself fails outright --
+    // unlike apply_sync_rs_commit_lsn's own peer_channel_==nullptr case (a replica's own best-effort, non-gating
+    // catch-up), this method exists to gate a RAFT proposal, so an inability to consult the quorum at all must
+    // surface as an error, never be silently swallowed.
+    async_result< std::vector< int64_t > > pre_resolve_slots(int64_t upto);
+
     // Called from CraftRaftListener::on_commit after deserialising the entry type. Detached (fire-and-forget)
     // from on_commit since that HomeStore callback is synchronous but catch-up here needs to co_await peer
     // fetch + journal writes.
@@ -326,8 +368,8 @@ private:
     bool login_in_progress_{false};
     std::mutex login_mu_;
     CraftRaftListener raft_listener_;
-    CraftPeerFetcher* peer_fetcher_{nullptr}; // null until S9 wires CraftConnector
-    uint32_t peer_fetch_timeout_ms_{5000}; // deadline for fetch_from_peer; overridden via set_peer_fetch_timeout_ms()
+    CraftPeerChannel* peer_channel_{nullptr}; // null until S9 wires CraftConnector; pre_resolve_slots fails closed without it
+    uint32_t peer_fetch_timeout_ms_{5000}; // deadline for fetch_from_peer/fetch_from_quorum; overridden via set_peer_fetch_timeout_ms()
     std::atomic< uint64_t > write_counter_{0}; // incremented per write(); triggers periodic SyncRSCommitLSN append
 };
 

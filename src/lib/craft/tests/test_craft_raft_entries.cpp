@@ -22,7 +22,7 @@
 //   - commit_lsn/last_append_lsn advance directly when there's no gap to catch up on
 //   - fetch_from_peer is invoked with exactly the missing LSNs when behind, and its response is persisted
 //   - a peer response naming an unrequested or duplicate LSN is rejected as a whole batch
-//   - catch-up is best-effort: a failed fetch, a failed write_slot, or no peer_fetcher_ at all still lets
+//   - catch-up is best-effort: a failed fetch, a failed write_slot, or no peer_channel_ at all still lets
 //     commit_lsn advance, leaving unresolved LSNs in missing_lsns_
 //   - commit_lsn never decrements
 //   - on_commit parses a real serialized SyncRSCommitLSN entry and dispatches correctly (and rejects
@@ -81,11 +81,14 @@ public:
     bool has_slot(int64_t lsn) const { return slots.count(lsn) > 0; }
 };
 
-// ── peer fetcher mock ─────────────────────────────────────────────────────────
+// ── peer channel mock ─────────────────────────────────────────────────────────
 //
-// Records the LSN list it was last called with; returns a programmable response or an injected error.
+// Records the LSN list fetch_from_peer was last called with; returns a programmable response or an
+// injected error. fetch_from_quorum isn't exercised by this file (see test_craft_pre_resolution.cpp) --
+// CraftPeerChannel bundles both because pre_resolve_slots's quorum broadcast and apply_sync_rs_commit_lsn's
+// single-peer catch-up are wired through the same production channel (CraftConnector, S9).
 
-class MockCraftPeerFetcher : public CraftPeerFetcher {
+class MockCraftPeerFetcher : public CraftPeerChannel {
 public:
     std::vector< int64_t > last_requested;
     uint32_t last_timeout_ms{0};
@@ -98,6 +101,11 @@ public:
         last_timeout_ms = timeout_ms;
         if (should_fail) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         co_return response;
+    }
+
+    async_result< std::vector< QuorumSlotResponse > > fetch_from_quorum(std::vector< int64_t >,
+                                                                         uint32_t) override {
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
 };
 
@@ -219,7 +227,7 @@ TEST_F(CraftRaftEntriesTest, EmptySlotWithinNewGapRangeNotDoubleTracked) {
     ASSERT_TRUE(r.has_value());
     EXPECT_TRUE(dev_->is_empty_slot(3));
     EXPECT_FALSE(dev_->is_missing(3));
-    // The rest of the newly-opened gap range (1, 2, 4, 5) is still missing -- no peer_fetcher_ wired.
+    // The rest of the newly-opened gap range (1, 2, 4, 5) is still missing -- no peer_channel_ wired.
     EXPECT_TRUE(dev_->is_missing(1));
     EXPECT_TRUE(dev_->is_missing(2));
     EXPECT_TRUE(dev_->is_missing(4));
@@ -232,7 +240,7 @@ TEST_F(CraftRaftEntriesTest, EmptySlotWithinNewGapRangeNotDoubleTracked) {
 
 // last_append_lsn already covers rs_commit_lsn: nothing to fetch, commit_lsn advances directly.
 TEST_F(CraftRaftEntriesTest, NoGapAdvancesDirectly) {
-    dev_->set_peer_fetcher(&fetcher_);
+    dev_->set_peer_channel(&fetcher_);
     dev_->seed_lsns(10, {});
 
     auto r = do_apply(/*rs_commit_lsn=*/5, /*client_token=*/0);
@@ -258,7 +266,7 @@ TEST_F(CraftRaftEntriesTest, CommitLsnNeverDecrements) {
 // Behind rs_commit_lsn: fetch_from_peer is called with exactly the missing LSNs, and its response
 // (one present slot, one Empty slot) is persisted/marked correctly.
 TEST_F(CraftRaftEntriesTest, BehindWithPeerFetcherAppliesFetchedSlots) {
-    dev_->set_peer_fetcher(&fetcher_);
+    dev_->set_peer_channel(&fetcher_);
     dev_->seed_lsns(0, {});
     fetcher_.response = {
         JournalSlot{.lsn = 1, .lba = 10, .len = 4},
@@ -279,7 +287,7 @@ TEST_F(CraftRaftEntriesTest, BehindWithPeerFetcherAppliesFetchedSlots) {
 
 // set_peer_fetch_timeout_ms() threads the configured deadline through to fetch_from_peer verbatim.
 TEST_F(CraftRaftEntriesTest, BehindPassesConfiguredTimeoutToPeerFetcher) {
-    dev_->set_peer_fetcher(&fetcher_);
+    dev_->set_peer_channel(&fetcher_);
     dev_->set_peer_fetch_timeout_ms(1234);
     dev_->seed_lsns(0, {});
     fetcher_.response = {JournalSlot{.lsn = 1, .lba = 10, .len = 4}};
@@ -296,7 +304,7 @@ TEST_F(CraftRaftEntriesTest, BehindPassesConfiguredTimeoutToPeerFetcher) {
 // still refuse the batch: none of the response is applied (same outcome as a fetch failure), even the
 // entries that individually look fine, and commit_lsn still advances (best-effort).
 TEST_F(CraftRaftEntriesTest, BehindRejectsPeerResponseWithUnrequestedLSN) {
-    dev_->set_peer_fetcher(&fetcher_);
+    dev_->set_peer_channel(&fetcher_);
     dev_->seed_lsns(0, {});
     fetcher_.response = {
         JournalSlot{.lsn = 1, .lba = 10, .len = 4},
@@ -317,7 +325,7 @@ TEST_F(CraftRaftEntriesTest, BehindRejectsPeerResponseWithUnrequestedLSN) {
 // A duplicate entry for an actually-requested LSN is just as much a contract violation as an
 // unrequested one (validate_fetch_response catches both the same way) -- same whole-batch rejection.
 TEST_F(CraftRaftEntriesTest, BehindRejectsPeerResponseWithDuplicateLSN) {
-    dev_->set_peer_fetcher(&fetcher_);
+    dev_->set_peer_channel(&fetcher_);
     dev_->seed_lsns(0, {});
     fetcher_.response = {
         JournalSlot{.lsn = 1, .lba = 10, .len = 4},
@@ -334,7 +342,7 @@ TEST_F(CraftRaftEntriesTest, BehindRejectsPeerResponseWithDuplicateLSN) {
 
 // fetch_from_peer fails outright: commit_lsn still advances (best-effort); every spanned LSN remains missing.
 TEST_F(CraftRaftEntriesTest, BehindFetchFailsStillAdvancesCommitLsn) {
-    dev_->set_peer_fetcher(&fetcher_);
+    dev_->set_peer_channel(&fetcher_);
     dev_->seed_lsns(0, {});
     fetcher_.should_fail = true;
 
@@ -346,7 +354,7 @@ TEST_F(CraftRaftEntriesTest, BehindFetchFailsStillAdvancesCommitLsn) {
     EXPECT_EQ(dev_->missing_count(), 3u);
 }
 
-// No peer_fetcher_ wired at all (S9 not wired yet): same best-effort outcome as a fetch failure.
+// No peer_channel_ wired at all (S9 not wired yet): same best-effort outcome as a fetch failure.
 TEST_F(CraftRaftEntriesTest, BehindNoPeerFetcherStillAdvancesCommitLsn) {
     dev_->seed_lsns(0, {});
 
@@ -360,7 +368,7 @@ TEST_F(CraftRaftEntriesTest, BehindNoPeerFetcherStillAdvancesCommitLsn) {
 // A fetched slot's write_slot fails: that LSN alone stays missing; the rest of catch-up still applies,
 // and commit_lsn still advances.
 TEST_F(CraftRaftEntriesTest, WriteSlotFailureDuringCatchupLeavesLsnMissing) {
-    dev_->set_peer_fetcher(&fetcher_);
+    dev_->set_peer_channel(&fetcher_);
     dev_->seed_lsns(0, {});
     fetcher_.response = {
         JournalSlot{.lsn = 1, .lba = 1, .len = 4},

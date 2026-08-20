@@ -19,6 +19,7 @@
 #include <homestore/logstore/log_store.hpp> // home_log_store, logstore_seq_num_t
 
 #include <optional>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -270,6 +271,93 @@ async_result< std::vector< JournalSlot > > CraftReplDev::fetch_data(std::vector<
     co_return result;
 }
 
+// ─── Leader pre-resolution (S5 / SDSTOR-22907) ────────────────────────────────
+//
+// candidates is the union of missing_lsns_ ∩ [0, upto] and (last_append_lsn, upto] minus empty_lsns_ -- not
+// simply missing_lsns_ ∩ [0, upto], since upto can exceed this leader's own last_append_lsn (a client Resolve
+// naming a dLSN this leader never received, or a login rs_commit_lsn that is the quorum's max, not this
+// replica's own) and those slots were never opened as a gap in missing_lsns_. missing_lsns_ ⊆ [0,
+// last_append_lsn] always holds, so the two ranges never overlap and both are ascending, so candidates and the
+// empty_slots returned below come out ascending for free.
+//
+// Read-only against missing_lsns_/last_append_lsn otherwise: missing_lsns_ entries are only erased once data
+// is genuinely written locally below; last_append_lsn only advances once the resulting SyncRSCommitLSN entry
+// commits (apply_sync_rs_commit_lsn's job, not this leader-side preparation).
+//
+// Known, accepted follow-up: a beyond-frontier candidate written here still gets re-marked missing and
+// re-fetched (single-peer) by apply_sync_rs_commit_lsn once the RAFT entry commits, since that method has no
+// way to know pre-resolution already wrote it. Self-healing, just a redundant fetch+write.
+
+async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t upto) {
+    std::vector< int64_t > candidates;
+    {
+        std::lock_guard lk{missing_mu_};
+        for (int64_t lsn : missing_lsns_) {
+            if (lsn <= upto) candidates.push_back(lsn);
+        }
+        for (int64_t lsn = state_.last_append_lsn + 1; lsn <= upto; ++lsn) {
+            if (!empty_lsns_.contains(lsn)) candidates.push_back(lsn);
+        }
+    }
+    if (candidates.empty()) co_return std::vector< int64_t >{};
+
+    if (peer_channel_ == nullptr) {
+        LOGW("pre_resolve_slots: {} slot(s) <= {} unresolved but no peer_channel_ wired -- refusing to resolve",
+             candidates.size(), upto);
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    }
+
+    auto responses = co_await peer_channel_->fetch_from_quorum(candidates, peer_fetch_timeout_ms_);
+    if (!responses) {
+        LOGE("pre_resolve_slots: fetch_from_quorum failed: {}", responses.error().message());
+        co_return std::unexpected(responses.error());
+    }
+
+    std::unordered_map< int64_t, JournalSlot* > data_by_lsn;
+    std::unordered_set< int64_t > empty_by_quorum;
+    for (auto& member : *responses) {
+        if (auto bad_lsn = validate_fetch_response(candidates, member.slots); bad_lsn) {
+            // Reject only this member's response, not the whole quorum fetch -- a broadcast should tolerate
+            // one misbehaving member without losing legitimate evidence from the rest.
+            LOGW("pre_resolve_slots: a quorum member's response named lsn={} not requested (or duplicated) -- "
+                 "discarding that member's entire reply", *bad_lsn);
+            continue;
+        }
+        for (auto& slot : member.slots) {
+            if (slot.is_empty) {
+                empty_by_quorum.insert(slot.lsn);
+                continue;
+            }
+            if (!data_by_lsn.contains(slot.lsn)) data_by_lsn.emplace(slot.lsn, &slot);
+        }
+    }
+
+    std::vector< int64_t > empty_slots;
+    for (int64_t lsn : candidates) {
+        // Empty beats data even across members.
+        if (empty_by_quorum.contains(lsn)) {
+            empty_slots.push_back(lsn);
+            continue;
+        }
+        auto it = data_by_lsn.find(lsn);
+        if (it == data_by_lsn.end()) {
+            // No responding member reported data or Empty: quorum-lacks-evidence.
+            empty_slots.push_back(lsn);
+            continue;
+        }
+        JournalSlot* slot = it->second;
+        auto res = co_await journal_->write_slot(slot->lsn, slot->lba, slot->len, std::move(slot->data));
+        if (!res) {
+            LOGE("pre_resolve_slots: write_slot failed lsn={}: {} -- leaving as unresolved", slot->lsn,
+                 res.error().message());
+            continue;
+        }
+        std::lock_guard lk{missing_mu_};
+        missing_lsns_.erase(lsn);
+    }
+    co_return empty_slots;
+}
+
 // ─── RAFT listener ────────────────────────────────────────────────────────────
 
 void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& header, sisl::blob const& key,
@@ -395,10 +483,10 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
     }
 
     if (!to_fetch.empty()) {
-        if (peer_fetcher_ == nullptr) {
-            LOGW("apply_sync_rs_commit_lsn: {} lsn(s) missing but no peer_fetcher_ wired -- leaving as missing",
+        if (peer_channel_ == nullptr) {
+            LOGW("apply_sync_rs_commit_lsn: {} lsn(s) missing but no peer_channel_ wired -- leaving as missing",
                 to_fetch.size());
-        } else if (auto fetched = co_await peer_fetcher_->fetch_from_peer(to_fetch, peer_fetch_timeout_ms_);
+        } else if (auto fetched = co_await peer_channel_->fetch_from_peer(to_fetch, peer_fetch_timeout_ms_);
                    !fetched) {
             LOGE("apply_sync_rs_commit_lsn: fetch_from_peer failed: {} -- leaving {} lsn(s) as missing",
                 fetched.error().message(), to_fetch.size());
