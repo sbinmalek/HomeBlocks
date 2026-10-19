@@ -162,14 +162,41 @@ public:
     // direct function calls (production is unwired, tests call synchronously).
     virtual async_result< std::vector< JournalSlot > > fetch_data(const std::vector< int64_t >& lsns,
                                                                   uint32_t timeout_ms) = 0;
-    // Broadcasts fetch_data(lsns) to every responding replica-set member; a non-responding member is
-    // simply absent from the result. Deliberately no replica-set-size/majority-count method: the
-    // contract is "trust whichever subset of members responded" -- there is no replica-set
-    // membership concept anywhere in this backend yet (S8/S9/S10 territory).
+    // Broadcasts fetch_data(lsns) to every OTHER responding replica-set member; a non-responding member
+    // is simply absent from the result. Whether the responders amount to a quorum is the caller's
+    // judgement, made against CraftRaftProposer::member_count() -- this interface only transports.
     virtual async_result< std::vector< QuorumSlotResponse > > fetch_from_quorum(std::vector< int64_t > lsns,
                                                                                 uint32_t timeout_ms) = 0;
+    // Broadcasts GetRSCommitLSN(term, is_login) to every OTHER replica-set member and returns each
+    // responder's {commit_lsn, last_append_lsn}; a non-responding member is absent from the result. Used
+    // by the watchdog trigger (is_login=false, never quiesces) and, once S7 lands, by login (is_login=true).
+    virtual async_result< std::vector< craft::lsn_pair > > poll_quorum_lsns(uint64_t term, bool is_login,
+                                                                            uint32_t timeout_ms) = 0;
     virtual ~CraftPeerFetcher() = default;
 };
+
+// ─── CraftRaftProposer ────────────────────────────────────────────────────────
+//
+// Abstraction over this partition's RAFT group (a HomeStore repl_dev in production): leadership,
+// membership, and proposing the CRAFT control-plane entries. Injected into CraftReplDev so unit tests
+// can run the leader-side paths (append(), pre_resolve_slots()) without a live RAFT group. Production
+// passes make_homestore_raft_proposer()'s result; wiring it to a volume's repl_dev is S8's job. Default
+// (null) leaves every leader-only path failing closed.
+
+class CraftRaftProposer {
+public:
+    virtual bool is_leader() const = 0;
+    // Voting replica-set size, including this member -- the denominator of every quorum decision here.
+    virtual uint32_t member_count() const = 0;
+    // Proposes a key-only RAFT entry (no data payload). Completes once the entry has committed and been
+    // dispatched to this member's CraftRaftListener::on_commit, or with an error if replication fails.
+    virtual async_status propose(sisl::blob header, sisl::blob key) = 0;
+    virtual ~CraftRaftProposer() = default;
+};
+
+// Wraps a HomeStore repl_dev whose listener is this partition's CraftRaftListener -- that listener is
+// what completes each proposal (on_commit / on_error), so the two must belong to the same repl_dev.
+unique< CraftRaftProposer > make_homestore_raft_proposer(shared< homestore::repl_dev > rd);
 
 // ─── checkpoint_trigger_fn_t ──────────────────────────────────────────────────
 //
@@ -308,8 +335,13 @@ public:
     // identical problem and force-flushes before removing its superblock for exactly this reason.
     async_status truncate(int64_t lsn);
 
-    // Propose a SyncRSCommitLSN RAFT entry (called by watchdog or leader during login).
-    async_status append(int64_t sync_to, uint64_t client_token);
+    // LEADER-only. Proposes a SyncRSCommitLSN RAFT entry and waits for it to commit. The single proposer
+    // behind every trigger: periodic, watchdog , client-requested,
+    // and login. Runs pre_resolve_slots(sync_to) first and never proposes
+    // past a slot it could not resolve -- the proposed watermark is clamped to just below the first one,
+    // and that achieved watermark is what comes back as resolved_upto, alongside every Empty verdict
+    // <= it (earlier rounds' included). At most one append() runs at a time
+    async_result< craft::resolution_result > append(int64_t sync_to, uint64_t client_token);
 
     // Return raw journal data for the requested LSNs. Empty slots return
     // JournalSlot{.is_empty=true} rather than an error.
@@ -370,6 +402,9 @@ public:
     // Called by CraftConnector (S9) after construction; tests inject a mock.
     void set_peer_fetcher(CraftPeerFetcher* f) { peer_fetcher_ = f; }
 
+    // Wires this partition's RAFT group (leadership, membership, proposing). Wired by S8; tests inject a mock.
+    void set_raft_proposer(CraftRaftProposer* p) { raft_proposer_ = p; }
+
     // Overrides the deadline passed to fetch_from_peer (default mirrors home_blks_config.fbs).
     // Production sets this from HB_DYNAMIC_CONFIG(peer_fetch_timeout_ms) after construction (S8/S9).
     void set_peer_fetch_timeout_ms(uint32_t ms) { peer_fetch_timeout_ms_ = ms; }
@@ -413,9 +448,18 @@ public:
     async_result< craft::read_result > read_with(int64_t read_lsn, uint64_t addr, uint64_t len, sisl::sg_list dest,
                                                  read_index_fn_t read_fn);
 
-    // Test-only observability for the watchdog: append() is still a stub with no other observable
-    // side effect, so this is how a test confirms on_watchdog_tick() actually fired.
+    // Test-only observability for the watchdog: counts ticks that found the session stale, on any member
+    // (counted before the leader check, so it's independent of whether a CraftRaftProposer is wired).
     int watchdog_fire_count() const { return watchdog_fire_count_; }
+
+    // Overrides the periodic SyncRSCommitLSN cadence read from sync_rs_commit_lsn_interval at construction.
+    void set_sync_lsn_interval(int64_t n) { sync_lsn_interval_ = n; }
+
+    // Highest watermark a committed append() proposed, or -1.
+    int64_t last_proposed_sync_lsn() const {
+        std::lock_guard lk{state_mu_};
+        return last_proposed_sync_lsn_;
+    }
 
     // Returns the recorded lsn for lba's overlay entry, or -1 if no overlay entry exists for lba.
     // Test-only observability for overlay retirement / highest-dLSN-wins correctness.
@@ -510,17 +554,35 @@ private:
     // a slot some responding member has real data for is written into this leader's own journal so it can
     // also correctly serve fetch_data() to others.
     //
-    // Returns every slot <= upto now verdicted Empty (freshly minted or inherited). A slot whose local
-    // journal write fails after a successful quorum fetch is left out of both the return value and
-    // missing_lsns_/empty_lsns_ (best-effort per-slot, same posture as apply_sync_rs_commit_lsn's own
-    // catch-up). The caller (append()/request_resolution(), SDSTOR-22908) must treat "still missing" as
-    // "not yet safe to propose past this slot", independent of whether the overall async_result succeeded.
+    // A fresh Empty verdict needs quorum-lacks evidence: this leader plus enough valid responders to make
+    // quorum_size(). An Empty inherited from a responder's prior verdict needs no count.
     //
-    // Fails closed (no partial resolution) if peer_fetcher_ is unset or the broadcast itself fails
-    // outright -- unlike apply_sync_rs_commit_lsn's own peer_fetcher_==nullptr case (a replica's own
-    // best-effort, non-gating catch-up), this method exists to gate a RAFT proposal, so an inability to
-    // consult the quorum at all must surface as an error, never be silently swallowed.
-    async_result< std::vector< int64_t > > pre_resolve_slots(int64_t upto);
+    // Returns the slots <= upto now verdicted Empty (freshly minted or inherited), and the ones left
+    // unresolved: too few responders to mint Empty, or a local journal write that failed after the
+    // fetch. append() never proposes past the first unresolved slot.
+    //
+    // Fails closed (no partial resolution) if peer_fetcher_ / raft_proposer_ is unset or the broadcast
+    // itself fails outright -- unlike apply_sync_rs_commit_lsn's own peer_fetcher_==nullptr case (a
+    // replica's own best-effort, non-gating catch-up), this method exists to gate a RAFT proposal, so an
+    // inability to consult the quorum at all must surface as an error, never be silently swallowed.
+    // Leadership and term are re-checked once the fetch returns, before any local write: NOT_LEADER /
+    // STALE_TERM with nothing mutated if either changed during the await.
+    struct PreResolution {
+        std::vector< int64_t > empty_slots;
+        std::vector< int64_t > unresolved;
+    };
+    async_result< PreResolution > pre_resolve_slots(int64_t upto);
+
+    // Majority of member_count(). Requires raft_proposer_.
+    uint32_t quorum_size() const { return raft_proposer_->member_count() / 2 + 1; }
+
+    // Watchdog trigger body: polls the quorum's LSNs and append()s up to max(last_append) if that's
+    // past what was last proposed. Leader-only; detached from on_watchdog_tick().
+    async_status watchdog_sync();
+
+    // Periodic trigger: once last_append_lsn is sync_lsn_interval_ past the last proposed watermark,
+    // detaches append(last_append_lsn). Leader-only; called from write()'s post-flight.
+    void maybe_trigger_periodic_sync();
 
     // Called from CraftRaftListener::on_commit after deserialising the entry type. Detached (fire-and-forget)
     // from on_commit since that HomeStore callback is synchronous but catch-up here needs to co_await peer
@@ -644,7 +706,10 @@ private:
     CraftRaftListener raft_listener_;
     CraftPeerFetcher* peer_fetcher_{nullptr};  // null until S9 wires CraftConnector
     uint32_t peer_fetch_timeout_ms_{5000};     // deadline for fetch_data; overridden via set_peer_fetch_timeout_ms()
-    std::atomic< uint64_t > write_counter_{0}; // incremented per write(); triggers periodic SyncRSCommitLSN append
+    CraftRaftProposer* raft_proposer_{nullptr}; // null until S8 wires the volume's repl_dev
+    std::atomic< bool > sync_in_flight_{false}; // single-flight gate for append()
+    int64_t last_proposed_sync_lsn_{-1};        // highest committed append() watermark (guarded by state_mu_)
+    int64_t sync_lsn_interval_{128};            // periodic trigger cadence; from sync_rs_commit_lsn_interval
 
     // Set by CraftRaftListener::on_restart() before detaching run_recovery(), cleared by run_recovery()
     // ONLY on a successful rebuild_overlay() (see recovery_faulted_ below for the failure path) --
