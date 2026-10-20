@@ -32,6 +32,7 @@
 // directly (same pattern as test_craft_raft_entries.cpp).
 
 #include <gtest/gtest.h>
+#include <functional>
 #include <map>
 #include <optional>
 #include <sisl/logging/logging.h>
@@ -64,14 +65,18 @@ public:
     std::optional< int64_t > fail_on_write;
     bool fail_alloc{false};
     int free_data_calls{0};
+    std::function< void(int64_t) > on_write; // runs inside write_slot, to change the term mid-await
+    std::function< void() > on_alloc;        // runs inside alloc_write_data, same purpose
 
     async_result< homestore::multi_blk_id > alloc_write_data(sisl::sg_list const&, lba_count_t) override {
+        if (on_alloc) on_alloc();
         if (fail_alloc) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         co_return homestore::multi_blk_id{};
     }
 
     async_status write_slot(int64_t lsn, uint64_t /* term */, lba_t lba, lba_count_t len, homestore::multi_blk_id blkid,
                             bool all_zeros, std::vector< homestore::csum_t > const& csums) override {
+        if (on_write) on_write(lsn);
         if (fail_on_write && *fail_on_write == lsn)
             co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         slots[lsn] = JournalSlot{
@@ -108,6 +113,7 @@ public:
     int call_count{0};
     std::vector< QuorumSlotResponse > response;
     bool should_fail{false};
+    std::function< void() > on_fetch; // runs inside the fetch, to change leader/term mid-await
 
     async_result< craft::lsn_pair > get_rs_commit_lsn(uint64_t /* term */, bool /* is_login */) override {
         co_return craft::lsn_pair{};
@@ -122,6 +128,7 @@ public:
         ++call_count;
         last_requested = lsns;
         last_timeout_ms = timeout_ms;
+        if (on_fetch) on_fetch();
         if (should_fail) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         co_return response;
     }
@@ -145,12 +152,14 @@ protected:
         auto mock = std::make_unique< MockCraftJournalBackend >();
         journal_ = mock.get();
         dev_ = CraftReplDev::create(volume_id_t{}, std::move(mock), k_page_size, nullptr);
+        dev_->set_raft_proposer(&proposer_);
     }
 
     auto do_pre_resolve(int64_t upto) { return homeblocks::detail::sync_get(dev_->pre_resolve_slots(upto)); }
 
     MockCraftJournalBackend* journal_{nullptr};
     MockCraftQuorumFetcher fetcher_;
+    MockCraftRaftProposer proposer_;
     std::shared_ptr< CraftReplDev > dev_;
 };
 
@@ -501,6 +510,178 @@ TEST_F(CraftPreResolutionTest, AllocWriteDataFailureLeavesLsnMissingNotInEmptySl
     EXPECT_FALSE(journal_->has_slot(3));
     EXPECT_TRUE(dev_->is_missing(3));
     EXPECT_EQ(journal_->free_data_calls, 0); // alloc never succeeded -- nothing to free
+}
+
+// ── leadership / term ─────────────────────────────────────────────────────────
+
+TEST_F(CraftPreResolutionTest, NullRaftProposerReturnsError) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->set_raft_proposer(nullptr);
+    dev_->seed_lsns(5, {3});
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), std::make_error_condition(std::errc::not_supported));
+    EXPECT_EQ(fetcher_.call_count, 0);
+}
+
+TEST_F(CraftPreResolutionTest, FollowerReturnsNotLeaderWithoutFetching) {
+    dev_->set_peer_fetcher(&fetcher_);
+    proposer_.leader = false;
+    dev_->seed_lsns(5, {3});
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::NOT_LEADER));
+    EXPECT_EQ(fetcher_.call_count, 0);
+}
+
+TEST_F(CraftPreResolutionTest, LeadershipLostDuringFetchWritesNothing) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {QuorumSlotResponse{.slots = {JournalSlot{.lsn = 3, .lba_off_bytes = 1, .len_bytes = 4}}}};
+    fetcher_.on_fetch = [this] { proposer_.leader = false; };
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::NOT_LEADER));
+    EXPECT_FALSE(journal_->has_slot(3));
+    EXPECT_TRUE(dev_->is_missing(3));
+}
+
+TEST_F(CraftPreResolutionTest, TermChangedDuringFetchWritesNothing) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_term(1);
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {QuorumSlotResponse{.slots = {JournalSlot{.lsn = 3, .lba_off_bytes = 1, .len_bytes = 4}}}};
+    fetcher_.on_fetch = [this] { dev_->seed_term(2); };
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
+    EXPECT_FALSE(journal_->has_slot(3));
+    EXPECT_TRUE(dev_->is_missing(3));
+}
+
+// Term bumps while slot 3's blocks are being allocated: nothing journalled, the allocation is freed.
+TEST_F(CraftPreResolutionTest, TermChangedBeforeSlotWriteFreesBlocksAndStops) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_term(1);
+    dev_->seed_lsns(5, {3, 4});
+    fetcher_.response = {QuorumSlotResponse{.slots = {JournalSlot{.lsn = 3, .lba_off_bytes = 1, .len_bytes = 4},
+                                                      JournalSlot{.lsn = 4, .lba_off_bytes = 1, .len_bytes = 4}}}};
+    journal_->on_alloc = [this] { dev_->seed_term(2); };
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
+    EXPECT_FALSE(journal_->has_slot(3));
+    EXPECT_FALSE(journal_->has_slot(4));
+    EXPECT_EQ(journal_->free_data_calls, 1);
+    EXPECT_TRUE(dev_->is_missing(3));
+    EXPECT_TRUE(dev_->is_missing(4));
+}
+
+// Term bumps during slot 3's write_slot: the entry stays journalled (and its blocks referenced), but
+// missing_lsns_ is untouched and slot 4 is never written.
+TEST_F(CraftPreResolutionTest, TermChangedDuringSlotWriteLeavesMissingAndStops) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_term(1);
+    dev_->seed_lsns(5, {3, 4});
+    fetcher_.response = {QuorumSlotResponse{.slots = {JournalSlot{.lsn = 3, .lba_off_bytes = 1, .len_bytes = 4},
+                                                      JournalSlot{.lsn = 4, .lba_off_bytes = 1, .len_bytes = 4}}}};
+    journal_->on_write = [this](int64_t lsn) {
+        if (lsn == 3) dev_->seed_term(2);
+    };
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
+    EXPECT_TRUE(journal_->has_slot(3));
+    EXPECT_FALSE(journal_->has_slot(4));
+    EXPECT_EQ(journal_->free_data_calls, 0);
+    EXPECT_TRUE(dev_->is_missing(3));
+    EXPECT_TRUE(dev_->is_missing(4));
+}
+
+// ── membership-aware quorum ───────────────────────────────────────────────────
+
+// N=5: self + 1 responder = 2 < quorum 3 -- not enough evidence to mint Empty.
+TEST_F(CraftPreResolutionTest, FiveMembersOneResponderLeavesSlotUnresolved) {
+    dev_->set_peer_fetcher(&fetcher_);
+    proposer_.members = 5;
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {QuorumSlotResponse{}};
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->empty_slots.empty());
+    EXPECT_EQ(r->unresolved, (std::vector< int64_t >{3}));
+    EXPECT_TRUE(dev_->is_missing(3));
+}
+
+// N=5: self + 2 responders = quorum 3.
+TEST_F(CraftPreResolutionTest, FiveMembersTwoRespondersMintsEmpty) {
+    dev_->set_peer_fetcher(&fetcher_);
+    proposer_.members = 5;
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {QuorumSlotResponse{}, QuorumSlotResponse{}};
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->empty_slots, (std::vector< int64_t >{3}));
+    EXPECT_TRUE(r->unresolved.empty());
+}
+
+// A malformed reply doesn't count toward quorum: N=5, two responders but one discarded.
+TEST_F(CraftPreResolutionTest, MalformedResponderDoesNotCountTowardQuorum) {
+    dev_->set_peer_fetcher(&fetcher_);
+    proposer_.members = 5;
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {QuorumSlotResponse{}, QuorumSlotResponse{.slots = {JournalSlot{.lsn = 99, .is_empty = true}}}};
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->unresolved, (std::vector< int64_t >{3}));
+}
+
+// An Empty a responder already holds from a prior verdict needs no quorum count.
+TEST_F(CraftPreResolutionTest, InheritedEmptyAcceptedBelowQuorum) {
+    dev_->set_peer_fetcher(&fetcher_);
+    proposer_.members = 5;
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {QuorumSlotResponse{.slots = {JournalSlot{.lsn = 3, .is_empty = true}}}};
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->empty_slots, (std::vector< int64_t >{3}));
+    EXPECT_TRUE(r->unresolved.empty());
+}
+
+// Data needs only one holder, quorum or not.
+TEST_F(CraftPreResolutionTest, DataFromSingleHolderWrittenBelowQuorum) {
+    dev_->set_peer_fetcher(&fetcher_);
+    proposer_.members = 5;
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {QuorumSlotResponse{.slots = {JournalSlot{.lsn = 3, .lba_off_bytes = 1, .len_bytes = 4}}}};
+
+    auto r = do_pre_resolve(/*upto=*/5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->empty_slots.empty());
+    EXPECT_TRUE(r->unresolved.empty());
+    EXPECT_TRUE(journal_->has_slot(3));
+    EXPECT_FALSE(dev_->is_missing(3));
 }
 
 } // namespace

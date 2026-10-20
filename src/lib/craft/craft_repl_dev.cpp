@@ -1758,16 +1758,36 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
     }
     if (candidates.empty()) co_return PreResolution{};
 
-    if (peer_fetcher_ == nullptr) {
-        LOGW("pre_resolve_slots: {} slot(s) <= {} unresolved but no peer_fetcher_ wired -- refusing to resolve",
+    if (peer_fetcher_ == nullptr || raft_proposer_ == nullptr) {
+        LOGW("pre_resolve_slots: {} slot(s) <= {} unresolved but peer_fetcher_/raft_proposer_ not wired -- "
+             "refusing to resolve",
              candidates.size(), upto);
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    }
+    if (!raft_proposer_->is_leader()) {
+        LOGW("pre_resolve_slots: not leader -- refusing to resolve upto={}", upto);
+        co_return std::unexpected(craft::make_error_condition(craft::craft_error::NOT_LEADER));
     }
 
     auto responses = co_await peer_fetcher_->fetch_from_quorum(candidates, peer_fetch_timeout_ms_);
     if (!responses) {
         LOGE("pre_resolve_slots: fetch_from_quorum failed: {}", responses.error().message());
         co_return std::unexpected(responses.error());
+    }
+
+    // Checked again: leadership or the session may have changed during the fetch -- bail before any
+    // local write rather than journal under a stale term.
+    if (!raft_proposer_->is_leader()) {
+        LOGW("pre_resolve_slots: lost leadership during quorum fetch -- abandoning upto={}", upto);
+        co_return std::unexpected(craft::make_error_condition(craft::craft_error::NOT_LEADER));
+    }
+    {
+        std::lock_guard lk{state_mu_};
+        if (state_.term != term) {
+            LOGW("pre_resolve_slots: term changed during quorum fetch ({} -> {}) -- abandoning upto={}", term,
+                 state_.term, upto);
+            co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+        }
     }
     if (responses->empty()) {
         LOGE("pre_resolve_slots: fetch_from_quorum returned zero responding members for {} candidate(s)",
@@ -1813,6 +1833,17 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
 
+    // Every candidate is a slot this leader lacks, so it counts itself among the members lacking it.
+    bool const quorum_lacks = 1 + static_cast< uint32_t >(valid_member_count) >= quorum_size();
+    if (!quorum_lacks)
+        LOGW("pre_resolve_slots: {} valid responder(s) + self < quorum {} of {} -- no fresh Empty verdicts",
+             valid_member_count, quorum_size(), raft_proposer_->member_count());
+
+    auto const term_changed = [this, term] {
+        std::lock_guard lk{state_mu_};
+        return state_.term != term;
+    };
+
     PreResolution result;
     for (int64_t lsn : candidates) {
         if (empty_by_quorum.contains(lsn)) {
@@ -1821,7 +1852,8 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
         }
         auto it = data_by_lsn.find(lsn);
         if (it == data_by_lsn.end()) {
-            result.empty_slots.push_back(lsn); // no responding member reported data or Empty: quorum-lacks-evidence
+            // No responding member reported data or Empty: Empty only on quorum-lacks evidence.
+            (quorum_lacks ? result.empty_slots : result.unresolved).push_back(lsn);
             continue;
         }
         JournalSlot* slot = it->second;
@@ -1841,6 +1873,16 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
             blkid = *alloc_res;
             blkid_allocated = true;
         }
+        // Each slot's IO is another await: a new session must never see this one's slots journalled, nor
+        // missing_lsns_ touched. Nothing references blkid yet, so it's safe to free here.
+        if (term_changed()) {
+            if (blkid_allocated) {
+                if (auto fr = co_await journal_->free_data(blkid); !fr)
+                    LOGE("pre_resolve_slots: free_data failed lsn={}: {}", slot->lsn, fr.error().message());
+            }
+            LOGW("pre_resolve_slots: term changed mid-resolution -- abandoning at lsn={}", slot->lsn);
+            co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+        }
         auto res = co_await journal_->write_slot(slot->lsn, term, slot->lba_off_bytes, slot->len_bytes, blkid,
                                                  slot->all_zeros, slot->csums);
         if (!res) {
@@ -1857,8 +1899,17 @@ async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int6
             result.unresolved.push_back(slot->lsn);
             continue;
         }
-        std::lock_guard lk{state_mu_};
-        missing_lsns_.erase(slot->lsn);
+        {
+            // Term checked in the same critical section as the erase. If it changed during write_slot, the
+            // entry stays journalled (blkid not freed -- the journal references it, same as write()'s
+            // post-flight) under its stale term for the next login to truncate; missing_lsns_ is untouched.
+            std::lock_guard lk{state_mu_};
+            if (state_.term != term) {
+                LOGW("pre_resolve_slots: term changed during write_slot -- abandoning at lsn={}", slot->lsn);
+                co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+            }
+            missing_lsns_.erase(slot->lsn);
+        }
     }
     co_return result;
 }

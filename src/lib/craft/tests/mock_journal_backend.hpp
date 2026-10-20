@@ -33,6 +33,25 @@ async_result< JournalSlot > mock_read_slot(Mock& mock, int64_t lsn) {
     co_return it->second;
 }
 
+// Leader of a 3-member group by default. propose() records each entry and succeeds unless `fail` is set.
+class MockCraftRaftProposer : public CraftRaftProposer {
+public:
+    bool leader{true};
+    uint32_t members{3};
+    bool fail{false};
+    std::vector< std::pair< std::vector< uint8_t >, std::vector< uint8_t > > > proposed; // {header, key}
+
+    bool is_leader() const override { return leader; }
+    uint32_t member_count() const override { return members; }
+
+    async_status propose(sisl::blob header, sisl::blob key) override {
+        if (fail) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
+        proposed.emplace_back(std::vector< uint8_t >(header.cbytes(), header.cbytes() + header.size()),
+                              std::vector< uint8_t >(key.cbytes(), key.cbytes() + key.size()));
+        co_return ok();
+    }
+};
+
 template < typename Mock >
 async_status mock_free_slot(Mock& mock, int64_t lsn) {
     auto it = mock.slots.find(lsn);
