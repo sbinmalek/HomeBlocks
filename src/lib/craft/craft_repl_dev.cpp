@@ -1459,9 +1459,89 @@ async_result< craft::resolution_result > CraftReplDev::request_resolution(craft:
     co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
 }
 
-async_result< craft::resolution_result > CraftReplDev::append(int64_t /* sync_to */, uint64_t /* client_token */) {
-    LOGW("CraftReplDev::append not yet implemented");
-    co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+// ─── append: propose SyncRSCommitLSN (S5 / SDSTOR-22908) ─────────────────────
+
+async_result< craft::resolution_result > CraftReplDev::append(int64_t sync_to, uint64_t client_token) {
+    if (raft_proposer_ == nullptr) co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    if (!raft_proposer_->is_leader())
+        co_return std::unexpected(craft::make_error_condition(craft::craft_error::NOT_LEADER));
+    if (sync_to < 0) co_return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
+
+    // Triggers detach this; keep the device alive across the awaits below.
+    auto self = shared_from_this();
+
+    bool expected = false;
+    if (!sync_in_flight_.compare_exchange_strong(expected, true)) {
+        LOGD("append: another append() in flight -- skipping sync_to={}", sync_to);
+        co_return std::unexpected(std::make_error_condition(std::errc::operation_in_progress));
+    }
+    struct SyncInFlightGuard {
+        CraftReplDev* dev;
+        ~SyncInFlightGuard() { dev->sync_in_flight_.store(false, std::memory_order_release); }
+    } in_flight_guard{this};
+
+    uint64_t term;
+    {
+        std::lock_guard lk{state_mu_};
+        term = state_.term;
+    }
+
+    auto pre = co_await pre_resolve_slots(sync_to);
+    if (!pre) co_return std::unexpected(pre.error());
+
+    // Never propose past an unresolved slot.
+    int64_t target = sync_to;
+    if (!pre->unresolved.empty())
+        target = std::min(target, *std::min_element(pre->unresolved.begin(), pre->unresolved.end()) - 1);
+    std::vector< int64_t > verdicts;
+    for (int64_t lsn : pre->empty_slots)
+        if (lsn <= target) verdicts.push_back(lsn);
+
+    // Already covered by a committed entry, nothing new to say -- skip the RAFT round.
+    bool skip;
+    {
+        std::lock_guard lk{state_mu_};
+        skip = target <= last_proposed_sync_lsn_ && verdicts.empty();
+    }
+
+    if (!skip) {
+        // Pre-resolution awaited: re-check right before proposing.
+        if (!raft_proposer_->is_leader())
+            co_return std::unexpected(craft::make_error_condition(craft::craft_error::NOT_LEADER));
+        {
+            std::lock_guard lk{state_mu_};
+            if (state_.term != term) co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+        }
+
+        std::vector< uint8_t > header(sizeof(CraftEntryHeader));
+        reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::SyncRSCommitLSN;
+        std::vector< uint8_t > key(sync_rs_commit_lsn_key_size(verdicts.size()));
+        serialize_sync_rs_commit_lsn(key.data(), target, client_token, verdicts);
+
+        if (auto r = co_await raft_proposer_->propose(sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
+                                                      sisl::blob{key.data(), static_cast< uint32_t >(key.size())});
+            !r) {
+            LOGE("append: SyncRSCommitLSN({}) proposal failed: {}", target, r.error().message());
+            co_return std::unexpected(r.error());
+        }
+    }
+
+    // Every Empty verdict <= target, earlier rounds' included, so a client that lost a reply still learns them.
+    // TODO: make empty_lsns_ a std::set (like missing_lsns_) so this is begin()..upper_bound(target), already
+    // sorted and unique, instead of a full scan plus sort/unique.
+    craft::resolution_result result{.resolved_upto = target, .empty_slots = {}};
+    {
+        std::lock_guard lk{state_mu_};
+        if (!skip) last_proposed_sync_lsn_ = std::max(last_proposed_sync_lsn_, target);
+        for (int64_t lsn : empty_lsns_)
+            if (lsn <= target) result.empty_slots.push_back(lsn);
+    }
+    result.empty_slots.insert(result.empty_slots.end(), verdicts.begin(), verdicts.end());
+    std::sort(result.empty_slots.begin(), result.empty_slots.end());
+    result.empty_slots.erase(std::unique(result.empty_slots.begin(), result.empty_slots.end()),
+                             result.empty_slots.end());
+    LOGD("append: SyncRSCommitLSN resolved_upto={} (asked {}) verdicts={}", target, sync_to, verdicts.size());
+    co_return result;
 }
 
 // ─── fetch_data (S6) ──────────────────────────────────────────────────────────

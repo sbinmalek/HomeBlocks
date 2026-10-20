@@ -14,6 +14,8 @@
  *********************************************************************************/
 #pragma once
 
+#include <functional>
+
 #include "craft/craft_repl_dev.hpp"
 
 // Shared free_slot body for CraftJournalBackend test mocks that record write_slot calls into a
@@ -33,13 +35,15 @@ async_result< JournalSlot > mock_read_slot(Mock& mock, int64_t lsn) {
     co_return it->second;
 }
 
-// Leader of a 3-member group by default. propose() records each entry and succeeds unless `fail` is set.
+// Leader of a 3-member group by default. propose() records each entry and succeeds unless `fail` is set;
+// on_commit, if set, runs with the entry as RAFT would (typically the device's own listener on_commit).
 class MockCraftRaftProposer : public CraftRaftProposer {
 public:
     bool leader{true};
     uint32_t members{3};
     bool fail{false};
     std::vector< std::pair< std::vector< uint8_t >, std::vector< uint8_t > > > proposed; // {header, key}
+    std::function< void(sisl::blob const&, sisl::blob const&) > on_commit;
 
     bool is_leader() const override { return leader; }
     uint32_t member_count() const override { return members; }
@@ -48,6 +52,7 @@ public:
         if (fail) co_return std::unexpected(std::make_error_condition(std::errc::io_error));
         proposed.emplace_back(std::vector< uint8_t >(header.cbytes(), header.cbytes() + header.size()),
                               std::vector< uint8_t >(key.cbytes(), key.cbytes() + key.size()));
+        if (on_commit) on_commit(header, key);
         co_return ok();
     }
 };

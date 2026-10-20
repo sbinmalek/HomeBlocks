@@ -13,7 +13,8 @@
  *
  *********************************************************************************/
 
-// Unit tests for CraftReplDev::pre_resolve_slots (S5 leader pre-resolution / SDSTOR-22907).
+// Unit tests for CraftReplDev::pre_resolve_slots (S5 leader pre-resolution / SDSTOR-22907), and for
+// append() (the SyncRSCommitLSN proposer built on it, SDSTOR-22908) under CraftAppendTest at the end.
 //
 // Verifies:
 //   - candidates are the union of missing_lsns_ <= upto AND the range past last_append_lsn up to upto (a
@@ -682,6 +683,204 @@ TEST_F(CraftPreResolutionTest, DataFromSingleHolderWrittenBelowQuorum) {
     EXPECT_TRUE(r->unresolved.empty());
     EXPECT_TRUE(journal_->has_slot(3));
     EXPECT_FALSE(dev_->is_missing(3));
+}
+
+// ── append() (SDSTOR-22908) ────────────────────────────────────────────────────
+//
+// append() is pre-resolution plus a SyncRSCommitLSN proposal, so it reuses this file's fixture. Proposals
+// loop back through the device's own CraftRaftListener::on_commit, so each committed entry is really applied.
+
+struct ProposedSync {
+    int64_t rs_commit_lsn;
+    uint64_t client_token;
+    std::vector< int64_t > empty_slots;
+};
+
+ProposedSync decode(std::pair< std::vector< uint8_t >, std::vector< uint8_t > > const& entry) {
+    EXPECT_EQ(reinterpret_cast< CraftEntryHeader const* >(entry.first.data())->type, CraftEntryType::SyncRSCommitLSN);
+    auto const* p = reinterpret_cast< SyncRSCommitLSNPayload const* >(entry.second.data());
+    auto empties = parse_empty_slots(sisl::blob{const_cast< uint8_t* >(entry.second.data()),
+                                                static_cast< uint32_t >(entry.second.size())});
+    return {p->rs_commit_lsn, p->client_token, empties.value_or(std::vector< int64_t >{})};
+}
+
+class CraftAppendTest : public CraftPreResolutionTest {
+protected:
+    void SetUp() override {
+        CraftPreResolutionTest::SetUp();
+        dev_->set_peer_fetcher(&fetcher_);
+        fetcher_.response = {QuorumSlotResponse{}}; // one responder holding nothing
+        proposer_.on_commit = [this](sisl::blob const& h, sisl::blob const& k) {
+            cintrusive< homestore::repl_req_ctx > ctx{};
+            dev_->test_listener().on_commit(1, h, k, {}, ctx);
+        };
+    }
+
+    auto do_append(int64_t sync_to, uint64_t token = 0) {
+        return homeblocks::detail::sync_get(dev_->append(sync_to, token));
+    }
+};
+
+// ── preconditions ─────────────────────────────────────────────────────────────
+
+TEST_F(CraftAppendTest, UnwiredProposerReturnsNotSupported) {
+    dev_->set_raft_proposer(nullptr);
+
+    auto r = do_append(5);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), std::make_error_condition(std::errc::not_supported));
+}
+
+TEST_F(CraftAppendTest, FollowerReturnsNotLeaderWithoutFetchingOrProposing) {
+    proposer_.leader = false;
+    dev_->seed_lsns(5, {3});
+
+    auto r = do_append(5);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::NOT_LEADER));
+    EXPECT_EQ(fetcher_.call_count, 0);
+    EXPECT_TRUE(proposer_.proposed.empty());
+}
+
+TEST_F(CraftAppendTest, NegativeSyncToRejected) {
+    auto r = do_append(-1);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), std::make_error_condition(std::errc::invalid_argument));
+}
+
+// ── proposing ─────────────────────────────────────────────────────────────────
+
+TEST_F(CraftAppendTest, ProposesWatermarkTokenAndVerdictsThenApplies) {
+    dev_->seed_lsns(5, {3}); // 3 lacked by self + the one responder: quorum of 3
+
+    auto r = do_append(5, /*token=*/42);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->resolved_upto, 5);
+    EXPECT_EQ(r->empty_slots, (std::vector< int64_t >{3}));
+    ASSERT_EQ(proposer_.proposed.size(), 1u);
+    auto const e = decode(proposer_.proposed[0]);
+    EXPECT_EQ(e.rs_commit_lsn, 5);
+    EXPECT_EQ(e.client_token, 42u);
+    EXPECT_EQ(e.empty_slots, (std::vector< int64_t >{3}));
+    EXPECT_TRUE(dev_->is_empty_slot(3));
+    EXPECT_EQ(dev_->commit_lsn(), 5);
+    EXPECT_EQ(dev_->last_proposed_sync_lsn(), 5);
+}
+
+// N=5, one responder: slot 3 can't be verdicted, so the watermark stops just below it.
+TEST_F(CraftAppendTest, ClampsBelowFirstUnresolvedSlot) {
+    proposer_.members = 5;
+    dev_->seed_lsns(6, {3});
+
+    auto r = do_append(6);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->resolved_upto, 2);
+    EXPECT_TRUE(r->empty_slots.empty());
+    ASSERT_EQ(proposer_.proposed.size(), 1u);
+    EXPECT_EQ(decode(proposer_.proposed[0]).rs_commit_lsn, 2);
+    EXPECT_EQ(dev_->commit_lsn(), 2);
+    EXPECT_TRUE(dev_->is_missing(3));
+}
+
+TEST_F(CraftAppendTest, UnresolvedFirstSlotProposesNothing) {
+    proposer_.members = 5;
+    dev_->seed_lsns(5, {0});
+
+    auto r = do_append(5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->resolved_upto, -1);
+    EXPECT_TRUE(proposer_.proposed.empty());
+}
+
+TEST_F(CraftAppendTest, AlreadyProposedWatermarkSkipsRaftRound) {
+    dev_->seed_lsns(5, {});
+
+    ASSERT_TRUE(do_append(5).has_value());
+    auto r = do_append(5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->resolved_upto, 5);
+    EXPECT_EQ(proposer_.proposed.size(), 1u);
+}
+
+// The reply carries earlier rounds' verdicts too, so a client that lost a reply still learns them.
+TEST_F(CraftAppendTest, ReplyIncludesEarlierRoundsVerdicts) {
+    dev_->seed_lsns(5, {3});
+    ASSERT_TRUE(do_append(5).has_value());
+
+    auto r = do_append(7); // 6 and 7 are beyond the frontier and held by nobody
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->resolved_upto, 7);
+    EXPECT_EQ(r->empty_slots, (std::vector< int64_t >{3, 6, 7}));
+    ASSERT_EQ(proposer_.proposed.size(), 2u);
+    EXPECT_EQ(decode(proposer_.proposed[1]).empty_slots, (std::vector< int64_t >{6, 7}));
+}
+
+// ── failures ──────────────────────────────────────────────────────────────────
+
+TEST_F(CraftAppendTest, PreResolutionFailurePropagatesWithoutProposal) {
+    dev_->seed_lsns(5, {3});
+    fetcher_.should_fail = true;
+
+    auto r = do_append(5);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), std::make_error_condition(std::errc::io_error));
+    EXPECT_TRUE(proposer_.proposed.empty());
+}
+
+// Leadership lost after pre-resolution (here, while it journals a fetched slot) -- caught right before proposing.
+TEST_F(CraftAppendTest, LeadershipLostBeforeProposeReturnsNotLeader) {
+    dev_->seed_lsns(5, {3});
+    fetcher_.response = {QuorumSlotResponse{.slots = {JournalSlot{.lsn = 3, .lba_off_bytes = 0, .len_bytes = 4096}}}};
+    journal_->on_write = [this](int64_t) { proposer_.leader = false; };
+
+    auto r = do_append(5);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::NOT_LEADER));
+    EXPECT_TRUE(proposer_.proposed.empty());
+    EXPECT_EQ(dev_->last_proposed_sync_lsn(), -1);
+}
+
+// A failed proposal propagates, doesn't advance the watermark, and releases the single-flight gate.
+TEST_F(CraftAppendTest, ProposeFailurePropagatesAndReleasesGate) {
+    dev_->seed_lsns(5, {});
+    proposer_.fail = true;
+
+    auto r = do_append(5);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), std::make_error_condition(std::errc::io_error));
+    EXPECT_EQ(dev_->last_proposed_sync_lsn(), -1);
+
+    proposer_.fail = false;
+    EXPECT_TRUE(do_append(5).has_value());
+}
+
+// A second append() while one is in flight (here, issued from inside the first one's commit) is rejected.
+TEST_F(CraftAppendTest, ConcurrentAppendRejected) {
+    dev_->seed_lsns(5, {});
+    std::optional< result< craft::resolution_result > > nested; // set inside on_commit
+    auto const loopback = proposer_.on_commit;
+    proposer_.on_commit = [&](sisl::blob const& h, sisl::blob const& k) {
+        nested = homeblocks::detail::sync_get(dev_->append(5, 0));
+        loopback(h, k);
+    };
+
+    auto r = do_append(5);
+
+    ASSERT_TRUE(r.has_value());
+    ASSERT_TRUE(nested.has_value());
+    ASSERT_FALSE(nested->has_value());
+    EXPECT_EQ(nested->error(), std::make_error_condition(std::errc::operation_in_progress));
 }
 
 } // namespace
