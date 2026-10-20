@@ -714,8 +714,8 @@ private:
     bool login_in_progress_{false};
     std::mutex login_mu_;
     CraftRaftListener raft_listener_;
-    CraftPeerFetcher* peer_fetcher_{nullptr};  // null until S9 wires CraftConnector
-    uint32_t peer_fetch_timeout_ms_{5000};     // deadline for fetch_data; overridden via set_peer_fetch_timeout_ms()
+    CraftPeerFetcher* peer_fetcher_{nullptr};   // null until S9 wires CraftConnector
+    uint32_t peer_fetch_timeout_ms_{5000};      // deadline for fetch_data; overridden via set_peer_fetch_timeout_ms()
     CraftRaftProposer* raft_proposer_{nullptr}; // null until S8 wires the volume's repl_dev
     std::atomic< bool > sync_in_flight_{false}; // single-flight gate for append()
     int64_t last_proposed_sync_lsn_{-1};        // highest committed append() watermark (guarded by state_mu_)

@@ -196,7 +196,7 @@ TEST_F(CraftWatchdogTest, LeaderStaleTickProposesQuorumMaxOnce) {
     arm_as_leader(7);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(1200)); // several stale ticks past the 300ms timeout
-    dev_.reset(); // joins any in-flight tick before the mocks are read
+    dev_.reset();                                                 // joins any in-flight tick before the mocks are read
 
     EXPECT_GE(fetcher_.poll_calls.load(), 2);
     ASSERT_EQ(proposer_.proposed.size(), 1u);

@@ -472,7 +472,7 @@ TEST_F(CraftPreResolutionTest, PerPeerUnrequestedOrDuplicateLsnDiscardsOnlyThatP
 
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->empty_slots, (std::vector< int64_t >{3, 4})); // 3 -> quorum-lacks-evidence, 4 -> inherited empty
-    EXPECT_FALSE(journal_->has_slot(3));           // A's data was discarded along with the rest of its reply
+    EXPECT_FALSE(journal_->has_slot(3)); // A's data was discarded along with the rest of its reply
     EXPECT_TRUE(dev_->is_missing(3));
     EXPECT_TRUE(dev_->is_missing(4));
 }
