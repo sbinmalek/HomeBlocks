@@ -499,13 +499,15 @@ private:
                        std::vector< homestore::multi_blk_id > const& blkids,
                        cintrusive< homestore::repl_req_ctx >& ctx) override;
 
+        // Fails this member's own pending proposal (see make_homestore_raft_proposer()).
+        void on_error(homestore::ReplServiceError err, const sisl::blob& header, const sisl::blob& key,
+                      cintrusive< homestore::repl_req_ctx >& ctx) override;
+
         // ── no-ops ────────────────────────────────────────────────────────
         bool on_pre_commit(int64_t, const sisl::blob&, const sisl::blob&,
                            cintrusive< homestore::repl_req_ctx >&) override {
             return true;
         }
-        void on_error(homestore::ReplServiceError, const sisl::blob&, const sisl::blob&,
-                      cintrusive< homestore::repl_req_ctx >&) override {}
         homestore::result< homestore::blk_alloc_hints >
         get_blk_alloc_hints(sisl::blob const&, uint32_t, cintrusive< homestore::repl_req_ctx >&) override {
             return homestore::blk_alloc_hints{};
@@ -518,8 +520,8 @@ private:
         void on_clean_replace_member_task(const std::string&, const homestore::replica_member_info&,
                                           const homestore::replica_member_info&, homestore::trace_id_t) override {}
         void on_remove_member(const homestore::replica_id_t&, homestore::trace_id_t) override {}
-        void on_rollback(int64_t, const sisl::blob&, const sisl::blob&,
-                         cintrusive< homestore::repl_req_ctx >&) override {}
+        void on_rollback(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
+                         cintrusive< homestore::repl_req_ctx >& ctx) override;
         // Fires rebuild_overlay() fire-and-forget (defined out-of-line in the .cpp -- needs
         // coro_helpers.hpp's detail::detach, which this header does not include).
         void on_restart() override;

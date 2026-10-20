@@ -136,6 +136,10 @@ public:
     async_result< std::vector< QuorumSlotResponse > > fetch_from_quorum(std::vector< int64_t >, uint32_t) override {
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
+
+    async_result< std::vector< craft::lsn_pair > > poll_quorum_lsns(uint64_t, bool, uint32_t) override {
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    }
 };
 
 // ── checkpoint trigger mock ───────────────────────────────────────────────────

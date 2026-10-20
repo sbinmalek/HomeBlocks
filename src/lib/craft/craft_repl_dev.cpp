@@ -379,6 +379,48 @@ checkpoint_trigger_fn_t make_homestore_checkpoint_trigger_fn() {
     };
 }
 
+// ─── HomeStore RAFT proposer ──────────────────────────────────────────────────
+
+namespace {
+// One in-flight proposal: owns the entry bytes until HomeStore is done with them, and carries the
+// completion CraftRaftListener's on_commit / on_error fulfil. Same bridge as volume.hpp's repl_result_ctx.
+struct craft_propose_ctx : public homestore::repl_req_ctx {
+    std::vector< uint8_t > header;
+    std::vector< uint8_t > key;
+    sisl::async::value_awaitable< status > promise_;
+};
+
+// No-op unless ctx is one of ours -- followers and log replay see a null ctx.
+void complete_proposal(cintrusive< homestore::repl_req_ctx >& ctx, status s) {
+    if (auto* p = dynamic_cast< craft_propose_ctx* >(ctx.get()); p) p->promise_.complete(std::move(s));
+}
+
+class HomeStoreCraftRaftProposer : public CraftRaftProposer {
+public:
+    explicit HomeStoreCraftRaftProposer(shared< homestore::repl_dev > rd) : rd_{std::move(rd)} {}
+
+    bool is_leader() const override { return rd_->is_leader(); }
+    uint32_t member_count() const override { return static_cast< uint32_t >(rd_->get_replication_quorum().size()); }
+
+    async_status propose(sisl::blob header, sisl::blob key) override {
+        auto ctx = intrusive< craft_propose_ctx >{new craft_propose_ctx()};
+        ctx->header.assign(header.cbytes(), header.cbytes() + header.size());
+        ctx->key.assign(key.cbytes(), key.cbytes() + key.size());
+        rd_->async_alloc_write(sisl::blob{ctx->header.data(), static_cast< uint32_t >(ctx->header.size())},
+                               sisl::blob{ctx->key.data(), static_cast< uint32_t >(ctx->key.size())},
+                               sisl::sg_list{} /* key-only entry */, ctx);
+        co_return co_await ctx->promise_;
+    }
+
+private:
+    shared< homestore::repl_dev > rd_;
+};
+} // namespace
+
+unique< CraftRaftProposer > make_homestore_raft_proposer(shared< homestore::repl_dev > rd) {
+    return std::make_unique< HomeStoreCraftRaftProposer >(std::move(rd));
+}
+
 // ─── constructor ──────────────────────────────────────────────────────────────
 
 CraftReplDev::CraftReplDev(volume_id_t vol_id, unique< CraftJournalBackend > journal, uint32_t lba_size,
@@ -388,6 +430,7 @@ CraftReplDev::CraftReplDev(volume_id_t vol_id, unique< CraftJournalBackend > jou
         lba_size_{lba_size},
         indx_tbl_{std::move(indx_tbl)},
         raft_listener_{this},
+        sync_lsn_interval_{static_cast< int64_t >(HB_DYNAMIC_CONFIG(sync_rs_commit_lsn_interval))},
         watchdog_timeout_ns_{HB_DYNAMIC_CONFIG(craft_watchdog_timeout_ms) * 1'000'000ULL} {}
 
 CraftReplDev::~CraftReplDev() {
@@ -1416,7 +1459,7 @@ async_result< craft::resolution_result > CraftReplDev::request_resolution(craft:
     co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
 }
 
-async_status CraftReplDev::append(int64_t /* sync_to */, uint64_t /* client_token */) {
+async_result< craft::resolution_result > CraftReplDev::append(int64_t /* sync_to */, uint64_t /* client_token */) {
     LOGW("CraftReplDev::append not yet implemented");
     co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
 }
@@ -1534,7 +1577,14 @@ async_status CraftReplDev::rebuild_overlay() {
 
 void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& header, sisl::blob const& key,
                                                 std::vector< homestore::multi_blk_id > const& /* blkids */,
-                                                cintrusive< homestore::repl_req_ctx >& /* ctx */) {
+                                                cintrusive< homestore::repl_req_ctx >& ctx) {
+    // Completes this member's own proposal on every exit: ok once dispatched, an error if the entry didn't parse.
+    struct ProposalCompleter {
+        cintrusive< homestore::repl_req_ctx >& ctx;
+        status outcome{std::unexpected(make_error_condition(volume_error::INVALID_ENTRY))};
+        ~ProposalCompleter() { complete_proposal(ctx, std::move(outcome)); }
+    } completer{ctx};
+
     if (header.size() < sizeof(CraftEntryHeader)) {
         LOGE("on_commit lsn={} header too small ({} bytes)", lsn, header.size());
         return;
@@ -1576,6 +1626,7 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
         // before starting the next -- not independent detached tasks.
         detail::detach(
             owner_->apply_sync_rs_commit_lsn(payload->rs_commit_lsn, payload->client_token, std::move(*empty_slots)));
+        completer.outcome = ok();
         break;
     }
     case CraftEntryType::InternalLogin: {
@@ -1587,12 +1638,30 @@ void CraftReplDev::CraftRaftListener::on_commit(int64_t lsn, sisl::blob const& h
         const auto* login_payload = reinterpret_cast< const InternalLoginPayload* >(key.cbytes());
         // Pure in-memory state transition (no co_await) -- called directly, not detached.
         owner_->apply_internal_login(login_payload->client_token, login_payload->term);
+        completer.outcome = ok();
         break;
     }
     default:
         LOGE("on_commit lsn={} unrecognized CraftEntryType={}", lsn, static_cast< uint8_t >(entry_hdr->type));
         break;
     }
+}
+
+void CraftReplDev::CraftRaftListener::on_error(homestore::ReplServiceError err, sisl::blob const& /* header */,
+                                               sisl::blob const& /* key */,
+                                               cintrusive< homestore::repl_req_ctx >& ctx) {
+    LOGW("proposal failed to replicate: {}", enum_name(err));
+    complete_proposal(ctx,
+                      std::unexpected(err == homestore::ReplServiceError::NOT_LEADER
+                                          ? craft::make_error_condition(craft::craft_error::NOT_LEADER)
+                                          : make_error_condition(volume_error::INTERNAL_ERROR)));
+}
+
+void CraftReplDev::CraftRaftListener::on_rollback(int64_t lsn, sisl::blob const& /* header */,
+                                                  sisl::blob const& /* key */,
+                                                  cintrusive< homestore::repl_req_ctx >& ctx) {
+    LOGW("on_rollback lsn={}", lsn);
+    complete_proposal(ctx, std::unexpected(craft::make_error_condition(craft::craft_error::NOT_LEADER)));
 }
 
 // Fired by HomeStore wherever this partition's repl_dev is recovered on restart. Fire-and-forget,
@@ -1655,7 +1724,7 @@ async_status CraftReplDev::run_recovery() {
 // re-fetched (single-peer) by apply_sync_rs_commit_lsn once the RAFT entry commits, since that method has
 // no way to know pre-resolution already wrote it. Self-healing, just a redundant fetch+write.
 
-async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t upto) {
+async_result< CraftReplDev::PreResolution > CraftReplDev::pre_resolve_slots(int64_t upto) {
     auto self = shared_from_this();
     std::vector< int64_t > candidates;
     uint64_t term;
@@ -1687,7 +1756,7 @@ async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t u
             if (!empty_lsns_.contains(lsn)) candidates.push_back(lsn);
         }
     }
-    if (candidates.empty()) co_return std::vector< int64_t >{};
+    if (candidates.empty()) co_return PreResolution{};
 
     if (peer_fetcher_ == nullptr) {
         LOGW("pre_resolve_slots: {} slot(s) <= {} unresolved but no peer_fetcher_ wired -- refusing to resolve",
@@ -1744,15 +1813,15 @@ async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t u
         co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
 
-    std::vector< int64_t > empty_slots;
+    PreResolution result;
     for (int64_t lsn : candidates) {
         if (empty_by_quorum.contains(lsn)) {
-            empty_slots.push_back(lsn);
+            result.empty_slots.push_back(lsn);
             continue;
         }
         auto it = data_by_lsn.find(lsn);
         if (it == data_by_lsn.end()) {
-            empty_slots.push_back(lsn); // no responding member reported data or Empty: quorum-lacks-evidence
+            result.empty_slots.push_back(lsn); // no responding member reported data or Empty: quorum-lacks-evidence
             continue;
         }
         JournalSlot* slot = it->second;
@@ -1766,6 +1835,7 @@ async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t u
             if (!alloc_res) {
                 LOGE("pre_resolve_slots: alloc_write_data failed lsn={}: {} -- leaving as unresolved", slot->lsn,
                      alloc_res.error().message());
+                result.unresolved.push_back(slot->lsn);
                 continue;
             }
             blkid = *alloc_res;
@@ -1784,12 +1854,13 @@ async_result< std::vector< int64_t > > CraftReplDev::pre_resolve_slots(int64_t u
                     co_return ok();
                 }());
             }
+            result.unresolved.push_back(slot->lsn);
             continue;
         }
         std::lock_guard lk{state_mu_};
         missing_lsns_.erase(slot->lsn);
     }
-    co_return empty_slots;
+    co_return result;
 }
 
 // ─── RAFT apply helpers (S5 implements) ──────────────────────────────────────
