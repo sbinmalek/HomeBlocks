@@ -388,11 +388,15 @@ struct craft_propose_ctx : public homestore::repl_req_ctx {
     std::vector< uint8_t > header;
     std::vector< uint8_t > key;
     sisl::async::value_awaitable< status > promise_;
+    std::atomic< bool > completed_{false}; // value_awaitable must complete exactly once
 };
 
-// No-op unless ctx is one of ours -- followers and log replay see a null ctx.
+// No-op unless ctx is one of ours -- followers and log replay see a null ctx. First outcome wins, should
+// HomeStore ever report more than one (e.g. on_rollback then on_error).
 void complete_proposal(cintrusive< homestore::repl_req_ctx >& ctx, status s) {
-    if (auto* p = dynamic_cast< craft_propose_ctx* >(ctx.get()); p) p->promise_.complete(std::move(s));
+    auto* p = dynamic_cast< craft_propose_ctx* >(ctx.get());
+    if (p == nullptr || p->completed_.exchange(true, std::memory_order_acq_rel)) return;
+    p->promise_.complete(std::move(s));
 }
 
 class HomeStoreCraftRaftProposer : public CraftRaftProposer {
@@ -420,6 +424,18 @@ private:
 unique< CraftRaftProposer > make_homestore_raft_proposer(shared< homestore::repl_dev > rd) {
     return std::make_unique< HomeStoreCraftRaftProposer >(std::move(rd));
 }
+
+#ifdef _PRERELEASE
+intrusive< homestore::repl_req_ctx > make_test_proposal_ctx() {
+    return intrusive< craft_propose_ctx >{new craft_propose_ctx()};
+}
+
+std::optional< status > take_test_proposal_outcome(intrusive< homestore::repl_req_ctx > const& ctx) {
+    auto* p = dynamic_cast< craft_propose_ctx* >(ctx.get());
+    if (p == nullptr || !p->promise_.await_ready()) return std::nullopt;
+    return p->promise_.await_resume();
+}
+#endif
 
 // ─── constructor ──────────────────────────────────────────────────────────────
 

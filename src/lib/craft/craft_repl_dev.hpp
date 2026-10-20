@@ -26,6 +26,7 @@
 #include <initializer_list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -197,6 +198,13 @@ public:
 // Wraps a HomeStore repl_dev whose listener is this partition's CraftRaftListener -- that listener is
 // what completes each proposal (on_commit / on_error), so the two must belong to the same repl_dev.
 unique< CraftRaftProposer > make_homestore_raft_proposer(shared< homestore::repl_dev > rd);
+
+#ifdef _PRERELEASE
+// Test seam for proposal completion: the same ctx make_homestore_raft_proposer() hands HomeStore, and its
+// outcome once CraftRaftListener has completed it (nullopt while pending). Single-shot: takes the outcome.
+intrusive< homestore::repl_req_ctx > make_test_proposal_ctx();
+std::optional< status > take_test_proposal_outcome(intrusive< homestore::repl_req_ctx > const& ctx);
+#endif
 
 // ─── checkpoint_trigger_fn_t ──────────────────────────────────────────────────
 //
