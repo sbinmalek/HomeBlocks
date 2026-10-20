@@ -711,6 +711,7 @@ private:
     CraftRaftProposer* raft_proposer_{nullptr}; // null until S8 wires the volume's repl_dev
     std::atomic< bool > sync_in_flight_{false}; // single-flight gate for append()
     int64_t last_proposed_sync_lsn_{-1};        // highest committed append() watermark (guarded by state_mu_)
+    int64_t last_periodic_sync_lsn_{-1};        // sync_to of the last periodic trigger (guarded by state_mu_)
     int64_t sync_lsn_interval_{128};            // periodic trigger cadence; from sync_rs_commit_lsn_interval
 
     // Set by CraftRaftListener::on_restart() before detaching run_recovery(), cleared by run_recovery()

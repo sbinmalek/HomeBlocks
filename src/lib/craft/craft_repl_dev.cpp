@@ -792,6 +792,7 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
     co_await commit(hdr.commit_lsn);
 
     touch_watchdog();
+    maybe_trigger_periodic_sync();
 
     // Re-snapshot after the piggyback commit() above: the pre-commit snapshot captured earlier
     // (before missing_lsns_.erase()) would otherwise report stale watermarks -- the ack should
@@ -1410,11 +1411,10 @@ void CraftReplDev::touch_watchdog() {
 
 // Runs every watchdog_timeout_ns_/2 once armed (iomgr::timer_token's recurring timer, not a one-shot
 // that reschedules itself) -- checks whether last_contact_ns_ is stale (elapsed >= the FULL
-// watchdog_timeout_ns_, not the tick interval) and, if so, proposes a SyncRSCommitLSN entry via
-// append(), fire-and-forget (detail::detach -- this runs in a plain timer-callback context, not a
-// coroutine caller awaiting a result). If the client stays silent this fires on every tick once past
-// the threshold, not just once, matching the old design's intent ("a permanently-silent client keeps
-// getting append() attempts, not just one").
+// watchdog_timeout_ns_, not the tick interval) and, if so and this member leads, detaches
+// watchdog_sync() (GetRSCommitLSN poll, then append()) -- this runs in a plain timer-callback context,
+// not a coroutine caller awaiting a result. Every stale tick tries again; watchdog_sync() skips once
+// the quorum's max last_append has already been proposed, so a silent client costs one RAFT entry.
 //
 // A recurring timer (vs the old one-shot-that-reschedules-itself) needs none of the generation
 // counter / in-flight counter / shutting-down flag the previous design required: iomgr's recurring
@@ -1443,20 +1443,100 @@ void CraftReplDev::on_watchdog_tick() {
 #ifdef _PRERELEASE
     ++watchdog_fire_count_;
 #endif
-    int64_t last_append_lsn;
+    // Only the leader proposes; followers' ticks just detect staleness.
+    if (raft_proposer_ == nullptr || !raft_proposer_->is_leader()) return;
+    if (sync_in_flight_.load(std::memory_order_acquire)) return;
+    // A tick can race the destructor's cancel(wait=true): the refcount may already be zero, where
+    // shared_from_this() would throw. Held across detach so watchdog_sync() can take its own reference.
+    auto self = weak_from_this().lock();
+    if (!self) return;
+    detail::detach(watchdog_sync());
+}
+
+// Client gone quiet: no live tail to protect, so sync to everything any responder holds.
+async_status CraftReplDev::watchdog_sync() {
+    auto self = shared_from_this();
+    if (peer_fetcher_ == nullptr) co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+
+    uint64_t term, client_token;
+    int64_t target;
+    {
+        std::lock_guard lk{state_mu_};
+        term = state_.term;
+        client_token = state_.client_token;
+        target = state_.last_append_lsn;
+    }
+
+    auto polled = co_await peer_fetcher_->poll_quorum_lsns(term, /* is_login = */ false, peer_fetch_timeout_ms_);
+    if (!polled) {
+        LOGW("watchdog_sync: quorum poll failed: {}", polled.error().message());
+        co_return std::unexpected(polled.error());
+    }
+    if (1 + polled->size() < quorum_size()) {
+        LOGW("watchdog_sync: {} responder(s) + self < quorum {} -- not syncing", polled->size(), quorum_size());
+        co_return std::unexpected(craft::make_error_condition(craft::craft_error::NO_QUORUM));
+    }
+    for (auto const& p : *polled)
+        target = std::max(target, p.last_append_lsn);
+
+    {
+        std::lock_guard lk{state_mu_};
+        if (target <= last_proposed_sync_lsn_) co_return ok(); // nothing new since the last sync
+    }
+    if (target < 0) co_return ok();
+
+    if (auto r = co_await append(target, client_token); !r) {
+        LOGW("watchdog_sync: append({}) failed: {}", target, r.error().message());
+        co_return std::unexpected(r.error());
+    }
+    co_return ok();
+}
+
+void CraftReplDev::maybe_trigger_periodic_sync() {
+    if (raft_proposer_ == nullptr || sync_lsn_interval_ <= 0) return;
+    if (sync_in_flight_.load(std::memory_order_acquire)) return;
+    if (!raft_proposer_->is_leader()) return;
+
+    int64_t sync_to;
     uint64_t client_token;
     {
         std::lock_guard lk{state_mu_};
-        last_append_lsn = state_.last_append_lsn;
+        // Measured from the last attempt too: while a hole stays unresolved, append() clamps below it and
+        // last_proposed_sync_lsn_ stalls -- without this every write would start another round.
+        auto const since = std::max(last_proposed_sync_lsn_, last_periodic_sync_lsn_);
+        if (state_.last_append_lsn - since < sync_lsn_interval_) return;
+        sync_to = state_.last_append_lsn;
         client_token = state_.client_token;
+        last_periodic_sync_lsn_ = sync_to;
     }
-    detail::detach(append(last_append_lsn, client_token));
+    detail::detach(append(sync_to, client_token));
 }
 
-async_result< craft::resolution_result > CraftReplDev::request_resolution(craft::client_hdr /* hdr */,
-                                                                          int64_t /* upto */) {
-    LOGW("CraftReplDev::request_resolution not yet implemented");
-    co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+async_result< craft::resolution_result > CraftReplDev::request_resolution(craft::client_hdr hdr, int64_t upto) {
+    if (recovery_faulted_.load(std::memory_order_acquire)) {
+        LOGE("request_resolution rejected: partition permanently faulted after failed restart recovery");
+        co_return std::unexpected(make_error_condition(volume_error::INTERNAL_ERROR));
+    }
+    if (recovering_.load(std::memory_order_acquire)) {
+        LOGW("request_resolution rejected: overlay rebuild in progress after restart");
+        co_return std::unexpected(make_error_condition(volume_error::OFFLINE));
+    }
+    if (raft_proposer_ == nullptr) co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    // NOT_LEADER before STALE_TERM, as in craft_client's reference: the client broadcasts to every member.
+    if (!raft_proposer_->is_leader())
+        co_return std::unexpected(craft::make_error_condition(craft::craft_error::NOT_LEADER));
+    uint64_t client_token;
+    {
+        std::lock_guard lk{state_mu_};
+        if (hdr.term != state_.term) {
+            LOGW("request_resolution rejected: stale term want={} got={}", state_.term, hdr.term);
+            co_return std::unexpected(make_error_condition(volume_error::STALE_TERM));
+        }
+        client_token = state_.client_token;
+    }
+    if (upto < 0) co_return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
+
+    co_return co_await append(upto, client_token);
 }
 
 // ─── append: propose SyncRSCommitLSN (S5 / SDSTOR-22908) ─────────────────────

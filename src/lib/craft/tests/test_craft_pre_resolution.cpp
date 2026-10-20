@@ -33,6 +33,7 @@
 // directly (same pattern as test_craft_raft_entries.cpp).
 
 #include <gtest/gtest.h>
+#include <array>
 #include <functional>
 #include <map>
 #include <optional>
@@ -690,20 +691,6 @@ TEST_F(CraftPreResolutionTest, DataFromSingleHolderWrittenBelowQuorum) {
 // append() is pre-resolution plus a SyncRSCommitLSN proposal, so it reuses this file's fixture. Proposals
 // loop back through the device's own CraftRaftListener::on_commit, so each committed entry is really applied.
 
-struct ProposedSync {
-    int64_t rs_commit_lsn;
-    uint64_t client_token;
-    std::vector< int64_t > empty_slots;
-};
-
-ProposedSync decode(std::pair< std::vector< uint8_t >, std::vector< uint8_t > > const& entry) {
-    EXPECT_EQ(reinterpret_cast< CraftEntryHeader const* >(entry.first.data())->type, CraftEntryType::SyncRSCommitLSN);
-    auto const* p = reinterpret_cast< SyncRSCommitLSNPayload const* >(entry.second.data());
-    auto empties = parse_empty_slots(sisl::blob{const_cast< uint8_t* >(entry.second.data()),
-                                                static_cast< uint32_t >(entry.second.size())});
-    return {p->rs_commit_lsn, p->client_token, empties.value_or(std::vector< int64_t >{})};
-}
-
 class CraftAppendTest : public CraftPreResolutionTest {
 protected:
     void SetUp() override {
@@ -718,6 +705,20 @@ protected:
 
     auto do_append(int64_t sync_to, uint64_t token = 0) {
         return homeblocks::detail::sync_get(dev_->append(sync_to, token));
+    }
+
+    // One-block data write at dlsn (write() CRCs the payload, so it needs a real buffer).
+    auto do_write(int64_t dlsn, uint64_t term = 0) {
+        static std::array< uint8_t, k_page_size > buf{};
+        sisl::sg_list data;
+        data.size = k_page_size;
+        data.iovs.push_back(iovec{buf.data(), buf.size()});
+        return homeblocks::detail::sync_get(
+            dev_->write(craft::client_hdr{term, -1, -1}, dlsn, 0, k_page_size, std::move(data)));
+    }
+
+    auto do_resolve(int64_t upto, uint64_t term = 0) {
+        return homeblocks::detail::sync_get(dev_->request_resolution(craft::client_hdr{term, -1, -1}, upto));
     }
 };
 
@@ -763,6 +764,7 @@ TEST_F(CraftAppendTest, ProposesWatermarkTokenAndVerdictsThenApplies) {
     EXPECT_EQ(r->empty_slots, (std::vector< int64_t >{3}));
     ASSERT_EQ(proposer_.proposed.size(), 1u);
     auto const e = decode(proposer_.proposed[0]);
+    EXPECT_EQ(e.type, CraftEntryType::SyncRSCommitLSN);
     EXPECT_EQ(e.rs_commit_lsn, 5);
     EXPECT_EQ(e.client_token, 42u);
     EXPECT_EQ(e.empty_slots, (std::vector< int64_t >{3}));
@@ -881,6 +883,121 @@ TEST_F(CraftAppendTest, ConcurrentAppendRejected) {
     ASSERT_TRUE(nested.has_value());
     ASSERT_FALSE(nested->has_value());
     EXPECT_EQ(nested->error(), std::make_error_condition(std::errc::operation_in_progress));
+}
+
+// ── periodic trigger (write()) ────────────────────────────────────────────────
+
+TEST_F(CraftAppendTest, PeriodicTriggerFiresEveryIntervalOnLeader) {
+    dev_->set_sync_lsn_interval(4);
+
+    for (int64_t dlsn = 0; dlsn <= 2; ++dlsn)
+        ASSERT_TRUE(do_write(dlsn).has_value());
+    EXPECT_TRUE(proposer_.proposed.empty());
+
+    ASSERT_TRUE(do_write(3).has_value()); // 4 LSNs appended since nothing was proposed
+    ASSERT_EQ(proposer_.proposed.size(), 1u);
+    EXPECT_EQ(decode(proposer_.proposed[0]).rs_commit_lsn, 3);
+    EXPECT_EQ(dev_->commit_lsn(), 3);
+
+    for (int64_t dlsn = 4; dlsn <= 7; ++dlsn)
+        ASSERT_TRUE(do_write(dlsn).has_value());
+    ASSERT_EQ(proposer_.proposed.size(), 2u);
+    EXPECT_EQ(decode(proposer_.proposed[1]).rs_commit_lsn, 7);
+}
+
+TEST_F(CraftAppendTest, PeriodicTriggerNeverFiresOnFollower) {
+    dev_->set_sync_lsn_interval(4);
+    proposer_.leader = false;
+
+    for (int64_t dlsn = 0; dlsn <= 7; ++dlsn)
+        ASSERT_TRUE(do_write(dlsn).has_value());
+
+    EXPECT_TRUE(proposer_.proposed.empty());
+    EXPECT_EQ(fetcher_.call_count, 0);
+}
+
+// A hole that can't be resolved (N=5, one responder) keeps the proposed watermark below it; the next
+// periodic attempt still waits a full interval rather than retrying on every write.
+TEST_F(CraftAppendTest, PeriodicTriggerThrottledWhileHoleUnresolved) {
+    dev_->set_sync_lsn_interval(4);
+    proposer_.members = 5;
+
+    ASSERT_TRUE(do_write(0).has_value());
+    for (int64_t dlsn = 2; dlsn <= 3; ++dlsn) // 1 is a hole
+        ASSERT_TRUE(do_write(dlsn).has_value());
+    EXPECT_EQ(fetcher_.call_count, 1);
+    ASSERT_EQ(proposer_.proposed.size(), 1u);
+    EXPECT_EQ(decode(proposer_.proposed[0]).rs_commit_lsn, 0); // clamped below the hole
+
+    for (int64_t dlsn = 4; dlsn <= 6; ++dlsn)
+        ASSERT_TRUE(do_write(dlsn).has_value());
+    EXPECT_EQ(fetcher_.call_count, 1);
+
+    ASSERT_TRUE(do_write(7).has_value());
+    EXPECT_EQ(fetcher_.call_count, 2);
+    EXPECT_EQ(proposer_.proposed.size(), 1u); // still clamped at 0: nothing new to propose
+}
+
+// ── client-requested (request_resolution) ─────────────────────────────────────
+
+TEST_F(CraftAppendTest, ResolveOnFollowerReturnsNotLeader) {
+    proposer_.leader = false;
+
+    auto r = do_resolve(5);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), craft::make_error_condition(craft::craft_error::NOT_LEADER));
+}
+
+TEST_F(CraftAppendTest, ResolveWithStaleTermRejected) {
+    dev_->seed_term(3);
+    dev_->seed_lsns(5, {3});
+
+    auto r = do_resolve(5, /*term=*/2);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
+    EXPECT_EQ(fetcher_.call_count, 0);
+}
+
+TEST_F(CraftAppendTest, ResolveNegativeUptoRejected) {
+    auto r = do_resolve(-1);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), std::make_error_condition(std::errc::invalid_argument));
+}
+
+// The failed-write flow: the round voids slot 3, and a late write into it is then rejected.
+TEST_F(CraftAppendTest, ResolveVerdictsEmptyAndLateWriteIsRejected) {
+    dev_->seed_lsns(5, {3});
+
+    auto r = do_resolve(5);
+
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->resolved_upto, 5);
+    EXPECT_EQ(r->empty_slots, (std::vector< int64_t >{3}));
+
+    auto w = do_write(3);
+    ASSERT_FALSE(w.has_value());
+    EXPECT_EQ(w.error(), make_error_condition(volume_error::EMPTY_SLOT));
+}
+
+// The proposed entry carries the session's client_token, set by the last InternalLogin.
+TEST_F(CraftAppendTest, ResolveProposesSessionClientToken) {
+    std::vector< uint8_t > header(sizeof(CraftEntryHeader));
+    reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::InternalLogin;
+    std::vector< uint8_t > key(sizeof(InternalLoginPayload));
+    *reinterpret_cast< InternalLoginPayload* >(key.data()) = InternalLoginPayload{.client_token = 99, .term = 4};
+    cintrusive< homestore::repl_req_ctx > ctx{};
+    dev_->test_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
+                                    sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
+    dev_->seed_lsns(5, {});
+
+    auto r = do_resolve(5, /*term=*/4);
+
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(proposer_.proposed.size(), 1u);
+    EXPECT_EQ(decode(proposer_.proposed[0]).client_token, 99u);
 }
 
 } // namespace
