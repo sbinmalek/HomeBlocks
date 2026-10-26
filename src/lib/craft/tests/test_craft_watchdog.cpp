@@ -123,16 +123,17 @@ protected:
     // keep_alive() with a matching term is the only public path that both succeeds (term check
     // passes) and calls touch_watchdog() -- write() would work too, but needs a real data payload
     // for the non-all_zeros case; keep_alive() needs nothing but the header.
-    auto do_keep_alive(uint64_t term) {
-        return homeblocks::detail::sync_get(dev_->keep_alive(craft::client_hdr{term, -1, -1}));
+    // commit_lsn is the client's piggybacked resolved prefix (-1 = not sent).
+    auto do_keep_alive(uint64_t term, int64_t commit_lsn = -1) {
+        return homeblocks::detail::sync_get(dev_->keep_alive(craft::client_hdr{term, commit_lsn, -1}));
     }
 
     // Wires a leader proposer + quorum poller and logs in at `term` (keep_alive arms the watchdog).
-    void arm_as_leader(uint64_t term) {
+    void arm_as_leader(uint64_t term, int64_t client_commit_lsn = -1) {
         dev_->set_peer_fetcher(&fetcher_);
         dev_->set_raft_proposer(&proposer_);
         dev_->seed_term(term);
-        ASSERT_TRUE(do_keep_alive(term).has_value());
+        ASSERT_TRUE(do_keep_alive(term, client_commit_lsn).has_value());
     }
 
     uint64_t orig_timeout_ms_{0};
@@ -188,12 +189,13 @@ TEST_F(CraftWatchdogTest, NoLoginNeverArms) {
 
 // ── leader sync (SDSTOR-22908) ────────────────────────────────────────────────
 
-// A stale tick on the leader polls the quorum and syncs to its max last_append -- once: later stale
-// ticks find that watermark already proposed.
-TEST_F(CraftWatchdogTest, LeaderStaleTickProposesQuorumMaxOnce) {
+// A stale tick on the leader polls the quorum, then syncs to min(quorum max last_append, the client's
+// commit_lsn) -- once: later stale ticks find that watermark already proposed. A peer holds up to 8, but
+// the client only confirmed 5, so 6..8 (possibly still in flight) are never examined.
+TEST_F(CraftWatchdogTest, LeaderStaleTickProposesUpToClientCommitOnce) {
     dev_->seed_lsns(5, {});
     fetcher_.polled = {craft::lsn_pair{.commit_lsn = -1, .last_append_lsn = 8}};
-    arm_as_leader(7);
+    arm_as_leader(7, /*client_commit_lsn=*/5);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(1200)); // several stale ticks past the 300ms timeout
     dev_.reset();                                                 // joins any in-flight tick before the mocks are read
@@ -201,8 +203,21 @@ TEST_F(CraftWatchdogTest, LeaderStaleTickProposesQuorumMaxOnce) {
     EXPECT_GE(fetcher_.poll_calls.load(), 2);
     ASSERT_EQ(proposer_.proposed.size(), 1u);
     auto const e = decode(proposer_.proposed[0]);
-    EXPECT_EQ(e.rs_commit_lsn, 8);
-    EXPECT_EQ(e.empty_slots, (std::vector< int64_t >{6, 7, 8})); // beyond every frontier, held by nobody
+    EXPECT_EQ(e.rs_commit_lsn, 5);
+    EXPECT_TRUE(e.empty_slots.empty());
+}
+
+// A client that never sent a commit_lsn has confirmed nothing: the watchdog polls but proposes nothing.
+TEST_F(CraftWatchdogTest, StaleTickWithoutClientCommitProposesNothing) {
+    dev_->seed_lsns(5, {});
+    fetcher_.polled = {craft::lsn_pair{.commit_lsn = -1, .last_append_lsn = 8}};
+    arm_as_leader(7);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(620));
+    dev_.reset();
+
+    EXPECT_GE(fetcher_.poll_calls.load(), 1);
+    EXPECT_TRUE(proposer_.proposed.empty());
 }
 
 TEST_F(CraftWatchdogTest, FollowerStaleTickNeverPolls) {

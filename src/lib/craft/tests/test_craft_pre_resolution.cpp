@@ -707,14 +707,15 @@ protected:
         return homeblocks::detail::sync_get(dev_->append(sync_to, token));
     }
 
-    // One-block data write at dlsn (write() CRCs the payload, so it needs a real buffer).
-    auto do_write(int64_t dlsn, uint64_t term = 0) {
+    // One-block data write at dlsn (write() CRCs the payload, so it needs a real buffer). commit_lsn is the
+    // client's piggybacked resolved prefix (-1 = not sent).
+    auto do_write(int64_t dlsn, uint64_t term = 0, int64_t commit_lsn = -1) {
         static std::array< uint8_t, k_page_size > buf{};
         sisl::sg_list data;
         data.size = k_page_size;
         data.iovs.push_back(iovec{buf.data(), buf.size()});
         return homeblocks::detail::sync_get(
-            dev_->write(craft::client_hdr{term, -1, -1}, dlsn, 0, k_page_size, std::move(data)));
+            dev_->write(craft::client_hdr{term, commit_lsn, -1}, dlsn, 0, k_page_size, std::move(data)));
     }
 
     auto do_resolve(int64_t upto, uint64_t term = 0) {
@@ -887,22 +888,53 @@ TEST_F(CraftAppendTest, ConcurrentAppendRejected) {
 
 // ── periodic trigger (write()) ────────────────────────────────────────────────
 
+// Each write piggybacks the previous slot as commit_lsn (one write in flight), so every periodic round
+// syncs to the client's confirmed prefix, one behind the leader's last_append_lsn.
 TEST_F(CraftAppendTest, PeriodicTriggerFiresEveryIntervalOnLeader) {
     dev_->set_sync_lsn_interval(4);
 
     for (int64_t dlsn = 0; dlsn <= 2; ++dlsn)
-        ASSERT_TRUE(do_write(dlsn).has_value());
+        ASSERT_TRUE(do_write(dlsn, 0, /*commit_lsn=*/dlsn - 1).has_value());
     EXPECT_TRUE(proposer_.proposed.empty());
 
-    ASSERT_TRUE(do_write(3).has_value()); // 4 LSNs appended since nothing was proposed
+    ASSERT_TRUE(do_write(3, 0, /*commit_lsn=*/2).has_value()); // 4 LSNs appended since the last attempt
     ASSERT_EQ(proposer_.proposed.size(), 1u);
-    EXPECT_EQ(decode(proposer_.proposed[0]).rs_commit_lsn, 3);
-    EXPECT_EQ(dev_->commit_lsn(), 3);
+    EXPECT_EQ(decode(proposer_.proposed[0]).rs_commit_lsn, 2); // the client's prefix, not last_append (3)
+    EXPECT_EQ(dev_->commit_lsn(), 2);
 
     for (int64_t dlsn = 4; dlsn <= 7; ++dlsn)
-        ASSERT_TRUE(do_write(dlsn).has_value());
+        ASSERT_TRUE(do_write(dlsn, 0, /*commit_lsn=*/dlsn - 1).has_value());
     ASSERT_EQ(proposer_.proposed.size(), 2u);
-    EXPECT_EQ(decode(proposer_.proposed[1]).rs_commit_lsn, 7);
+    EXPECT_EQ(decode(proposer_.proposed[1]).rs_commit_lsn, 6);
+}
+
+// The C1 race: slot 3 is still in flight (a gap below the leader's last_append_lsn) when the round runs.
+// The client's commit_lsn (2) stops below it, so the round never examines 3 and can't vote it Empty.
+TEST_F(CraftAppendTest, PeriodicTriggerNeverReachesPastClientCommit) {
+    dev_->set_sync_lsn_interval(4);
+
+    for (int64_t dlsn = 0; dlsn <= 2; ++dlsn)
+        ASSERT_TRUE(do_write(dlsn, 0, /*commit_lsn=*/dlsn - 1).has_value());
+    ASSERT_TRUE(do_write(4, 0, /*commit_lsn=*/2).has_value()); // 3 still in flight
+
+    ASSERT_EQ(proposer_.proposed.size(), 1u);
+    auto const e = decode(proposer_.proposed[0]);
+    EXPECT_EQ(e.rs_commit_lsn, 2);
+    EXPECT_TRUE(e.empty_slots.empty());
+    EXPECT_EQ(fetcher_.call_count, 0); // slot 3 was never a candidate
+    EXPECT_TRUE(dev_->is_missing(3));
+    EXPECT_FALSE(dev_->is_empty_slot(3));
+}
+
+// A client that hasn't sent a commit_lsn yet has confirmed nothing: the cadence fires, but nothing is proposed.
+TEST_F(CraftAppendTest, PeriodicTriggerProposesNothingWithoutClientCommit) {
+    dev_->set_sync_lsn_interval(4);
+
+    for (int64_t dlsn = 0; dlsn <= 7; ++dlsn)
+        ASSERT_TRUE(do_write(dlsn).has_value());
+
+    EXPECT_TRUE(proposer_.proposed.empty());
+    EXPECT_EQ(fetcher_.call_count, 0);
 }
 
 TEST_F(CraftAppendTest, PeriodicTriggerNeverFiresOnFollower) {
@@ -916,26 +948,49 @@ TEST_F(CraftAppendTest, PeriodicTriggerNeverFiresOnFollower) {
     EXPECT_EQ(fetcher_.call_count, 0);
 }
 
-// A hole that can't be resolved (N=5, one responder) keeps the proposed watermark below it; the next
-// periodic attempt still waits a full interval rather than retrying on every write.
+// A lagging leader: the client confirmed slot 1, but this leader missed it and can't fetch it (N=5, one
+// responder), so the proposed watermark stays below the hole. The next periodic attempt still waits a full
+// interval rather than retrying on every write.
 TEST_F(CraftAppendTest, PeriodicTriggerThrottledWhileHoleUnresolved) {
     dev_->set_sync_lsn_interval(4);
     proposer_.members = 5;
 
     ASSERT_TRUE(do_write(0).has_value());
-    for (int64_t dlsn = 2; dlsn <= 3; ++dlsn) // 1 is a hole
-        ASSERT_TRUE(do_write(dlsn).has_value());
+    ASSERT_TRUE(do_write(2, 0, /*commit_lsn=*/0).has_value()); // 1 is a hole on this leader
+    ASSERT_TRUE(do_write(3, 0, /*commit_lsn=*/2).has_value()); // the client has resolved 1 and 2
     EXPECT_EQ(fetcher_.call_count, 1);
     ASSERT_EQ(proposer_.proposed.size(), 1u);
     EXPECT_EQ(decode(proposer_.proposed[0]).rs_commit_lsn, 0); // clamped below the hole
 
     for (int64_t dlsn = 4; dlsn <= 6; ++dlsn)
-        ASSERT_TRUE(do_write(dlsn).has_value());
+        ASSERT_TRUE(do_write(dlsn, 0, /*commit_lsn=*/dlsn - 1).has_value());
     EXPECT_EQ(fetcher_.call_count, 1);
 
-    ASSERT_TRUE(do_write(7).has_value());
+    ASSERT_TRUE(do_write(7, 0, /*commit_lsn=*/6).has_value());
     EXPECT_EQ(fetcher_.call_count, 2);
     EXPECT_EQ(proposer_.proposed.size(), 1u); // still clamped at 0: nothing new to propose
+}
+
+// The piggybacked commit_lsn never regresses on a stale/reordered message, ignores the "not sent" -1, and
+// starts over when InternalLogin opens a new session.
+TEST_F(CraftAppendTest, ClientCommitLsnIsMaxMonotonicAndResetByLogin) {
+    EXPECT_EQ(dev_->client_commit_lsn(), -1);
+
+    ASSERT_TRUE(do_write(0, 0, /*commit_lsn=*/-1).has_value());
+    EXPECT_EQ(dev_->client_commit_lsn(), -1);
+    ASSERT_TRUE(do_write(4, 0, /*commit_lsn=*/3).has_value());
+    EXPECT_EQ(dev_->client_commit_lsn(), 3);
+    ASSERT_TRUE(do_write(5, 0, /*commit_lsn=*/1).has_value()); // reordered: older prefix
+    EXPECT_EQ(dev_->client_commit_lsn(), 3);
+
+    std::vector< uint8_t > header(sizeof(CraftEntryHeader));
+    reinterpret_cast< CraftEntryHeader* >(header.data())->type = CraftEntryType::InternalLogin;
+    std::vector< uint8_t > key(sizeof(InternalLoginPayload));
+    *reinterpret_cast< InternalLoginPayload* >(key.data()) = InternalLoginPayload{.client_token = 9, .term = 2};
+    cintrusive< homestore::repl_req_ctx > ctx{};
+    dev_->test_listener().on_commit(1, sisl::blob{header.data(), static_cast< uint32_t >(header.size())},
+                                    sisl::blob{key.data(), static_cast< uint32_t >(key.size())}, {}, ctx);
+    EXPECT_EQ(dev_->client_commit_lsn(), -1);
 }
 
 // ── client-requested (request_resolution) ─────────────────────────────────────

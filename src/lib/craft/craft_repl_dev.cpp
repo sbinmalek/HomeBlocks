@@ -660,6 +660,8 @@ async_result< craft::lsn_pair > CraftReplDev::write(craft::client_hdr hdr, int64
         // There is no other per-call bound to validate against here -- see keep_alive()'s doc comment.
         if (hdr.all_committed_lsn >= -1)
             state_.all_committed_lsn = std::max(state_.all_committed_lsn, hdr.all_committed_lsn);
+        // The session's resolved prefix caps background SyncRSCommitLSN rounds (-1 = not sent).
+        if (hdr.commit_lsn >= 0) client_commit_lsn_ = std::max(client_commit_lsn_, hdr.commit_lsn);
         if (empty_lsns_.contains(dlsn)) {
             LOGW("write rejected: slot is permanently empty dlsn={}", dlsn);
             co_return std::unexpected(make_error_condition(volume_error::EMPTY_SLOT));
@@ -1114,6 +1116,8 @@ async_result< craft::read_result > CraftReplDev::read(craft::client_hdr hdr, int
         // Reject malformed negative values -- see write()'s doc comment.
         if (hdr.all_committed_lsn >= -1)
             state_.all_committed_lsn = std::max(state_.all_committed_lsn, hdr.all_committed_lsn);
+        // The session's resolved prefix caps background SyncRSCommitLSN rounds (-1 = not sent).
+        if (hdr.commit_lsn >= 0) client_commit_lsn_ = std::max(client_commit_lsn_, hdr.commit_lsn);
     }
     // Best-effort piggyback, same reasoning as write()'s: read()'s own success does not depend on
     // whether commit() advances further, so a genuine commit() fault here is swallowed rather than
@@ -1354,6 +1358,8 @@ async_result< craft::lsn_pair > CraftReplDev::keep_alive(craft::client_hdr hdr) 
         // before consuming this floor, not this layer.
         if (hdr.all_committed_lsn >= -1)
             state_.all_committed_lsn = std::max(state_.all_committed_lsn, hdr.all_committed_lsn);
+        // The session's resolved prefix caps background SyncRSCommitLSN rounds (-1 = not sent).
+        if (hdr.commit_lsn >= 0) client_commit_lsn_ = std::max(client_commit_lsn_, hdr.commit_lsn);
     }
 
     touch_watchdog();
@@ -1469,7 +1475,9 @@ void CraftReplDev::on_watchdog_tick() {
     detail::detach(watchdog_sync());
 }
 
-// Client gone quiet: no live tail to protect, so sync to everything any responder holds.
+// Client gone quiet: sync to what any responder holds, capped at the client's confirmed prefix
+// (client_commit_lsn_). A delayed write can still land after the poll, so the round must not reach
+// anything the client hasn't resolved.
 async_status CraftReplDev::watchdog_sync() {
     auto self = shared_from_this();
     if (peer_fetcher_ == nullptr) co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
@@ -1497,7 +1505,8 @@ async_status CraftReplDev::watchdog_sync() {
 
     {
         std::lock_guard lk{state_mu_};
-        if (target <= last_proposed_sync_lsn_) co_return ok(); // nothing new since the last sync
+        target = std::min(target, client_commit_lsn_);
+        if (target <= last_proposed_sync_lsn_) co_return ok(); // nothing newly confirmed since the last sync
     }
     if (target < 0) co_return ok();
 
@@ -1517,13 +1526,15 @@ void CraftReplDev::maybe_trigger_periodic_sync() {
     uint64_t client_token;
     {
         std::lock_guard lk{state_mu_};
-        // Measured from the last attempt too: while a hole stays unresolved, append() clamps below it and
-        // last_proposed_sync_lsn_ stalls -- without this every write would start another round.
-        auto const since = std::max(last_proposed_sync_lsn_, last_periodic_sync_lsn_);
-        if (state_.last_append_lsn - since < sync_lsn_interval_) return;
-        sync_to = state_.last_append_lsn;
+        // Cadence: every sync_lsn_interval_ appended LSNs since the last attempt (not the last proposal,
+        // which can stall below an unresolved hole and would then retrigger on every write).
+        if (state_.last_append_lsn - last_periodic_sync_lsn_ < sync_lsn_interval_) return;
+        last_periodic_sync_lsn_ = state_.last_append_lsn;
+        // Only what the client has confirmed: nothing at or below its commit_lsn is still in flight, so the
+        // round can't vote a write the client may yet count as acknowledged Empty.
+        sync_to = std::min(state_.last_append_lsn, client_commit_lsn_);
+        if (sync_to <= last_proposed_sync_lsn_) return; // nothing newly confirmed
         client_token = state_.client_token;
-        last_periodic_sync_lsn_ = sync_to;
     }
     detail::detach(append(sync_to, client_token));
 }
@@ -2268,6 +2279,8 @@ async_status CraftReplDev::apply_sync_rs_commit_lsn(int64_t rs_commit_lsn, uint6
 void CraftReplDev::apply_internal_login(uint64_t client_token, uint64_t term) {
     std::lock_guard lk{state_mu_};
     state_.client_token = client_token; // opaque id, no ordering semantics -- plain overwrite
+    // A new session starts with no confirmed prefix of its own.
+    if (term > state_.term) client_commit_lsn_ = -1;
     // term is RAFT-ordered in practice (the leader always proposes strictly increasing terms), but
     // guard against regression the same way commit_lsn/last_append_lsn already do rather than trusting
     // log order blindly.

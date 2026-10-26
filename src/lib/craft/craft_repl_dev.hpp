@@ -469,6 +469,12 @@ public:
         return last_proposed_sync_lsn_;
     }
 
+    // Highest commit_lsn the current session has piggybacked, or -1.
+    int64_t client_commit_lsn() const {
+        std::lock_guard lk{state_mu_};
+        return client_commit_lsn_;
+    }
+
     // Returns the recorded lsn for lba's overlay entry, or -1 if no overlay entry exists for lba.
     // Test-only observability for overlay retirement / highest-dLSN-wins correctness.
     int64_t overlay_lsn_for(lba_t lba) const {
@@ -586,12 +592,14 @@ private:
     // Majority of member_count(). Requires raft_proposer_.
     uint32_t quorum_size() const { return raft_proposer_->member_count() / 2 + 1; }
 
-    // Watchdog trigger body: polls the quorum's LSNs and append()s up to max(last_append) if that's
-    // past what was last proposed. Leader-only; detached from on_watchdog_tick().
+    // Watchdog trigger body: polls the quorum's LSNs and append()s up to min(max(last_append),
+    // client_commit_lsn_) if that's past what was last proposed. Leader-only; detached from
+    // on_watchdog_tick().
     async_status watchdog_sync();
 
-    // Periodic trigger: once last_append_lsn is sync_lsn_interval_ past the last proposed watermark,
-    // detaches append(last_append_lsn). Leader-only; called from write()'s post-flight.
+    // Periodic trigger: every sync_lsn_interval_ appended LSNs, detaches
+    // append(min(last_append_lsn, client_commit_lsn_)) if that's past what was last proposed.
+    // Leader-only; called from write()'s post-flight.
     void maybe_trigger_periodic_sync();
 
     // Called from CraftRaftListener::on_commit after deserialising the entry type. Detached (fire-and-forget)
@@ -688,7 +696,7 @@ private:
     // see write()'s doc comment at the in_flight_write_dlsns_.contains() check for why this exists.
     std::set< int64_t > in_flight_write_dlsns_;
     mutable std::mutex state_mu_; // guards state_, missing_lsns_, empty_lsns_, commit_running_,
-                                  // in_flight_write_dlsns_, and last_checkpoint_lsn_
+                                  // in_flight_write_dlsns_, last_checkpoint_lsn_, and client_commit_lsn_
 
     // One highest-dLSN-unapplied entry per LBA in (commit_lsn, last_append_lsn]: makes an appended-
     // but-not-yet-committed write locally readable ahead of commit() applying it to the index.
@@ -719,8 +727,12 @@ private:
     CraftRaftProposer* raft_proposer_{nullptr}; // null until S8 wires the volume's repl_dev
     std::atomic< bool > sync_in_flight_{false}; // single-flight gate for append()
     int64_t last_proposed_sync_lsn_{-1};        // highest committed append() watermark (guarded by state_mu_)
-    int64_t last_periodic_sync_lsn_{-1};        // sync_to of the last periodic trigger (guarded by state_mu_)
-    int64_t sync_lsn_interval_{128};            // periodic trigger cadence; from sync_rs_commit_lsn_interval
+    int64_t last_periodic_sync_lsn_{-1};        // last_append_lsn at the last periodic trigger (guarded by state_mu_)
+    // Highest commit_lsn the current session has piggybacked on write/read/keep_alive: the client's
+    // resolved prefix, so nothing at or below it is still in flight.
+    // Reset when InternalLogin starts a new session. Guarded by state_mu_.
+    int64_t client_commit_lsn_{-1};
+    int64_t sync_lsn_interval_{128}; // periodic trigger cadence; from sync_rs_commit_lsn_interval
 
     // Set by CraftRaftListener::on_restart() before detaching run_recovery(), cleared by run_recovery()
     // ONLY on a successful rebuild_overlay() (see recovery_faulted_ below for the failure path) --
