@@ -157,7 +157,13 @@ protected:
         dev_->set_raft_proposer(&proposer_);
     }
 
-    auto do_pre_resolve(int64_t upto) { return homeblocks::detail::sync_get(dev_->pre_resolve_slots(upto)); }
+    // pre_resolve_slots is private and only this fixture is a friend (TEST_F bodies are subclasses, which
+    // don't inherit friendship), so tests reach it through these helpers.
+    auto do_pre_resolve(int64_t upto, uint64_t term) {
+        return homeblocks::detail::sync_get(dev_->pre_resolve_slots(upto, term));
+    }
+    // Runs within the device's current session, as a well-behaved caller does.
+    auto do_pre_resolve(int64_t upto) { return do_pre_resolve(upto, dev_->term()); }
 
     MockCraftJournalBackend* journal_{nullptr};
     MockCraftQuorumFetcher fetcher_;
@@ -704,7 +710,7 @@ protected:
     }
 
     auto do_append(int64_t sync_to, uint64_t token = 0) {
-        return homeblocks::detail::sync_get(dev_->append(sync_to, token));
+        return homeblocks::detail::sync_get(dev_->append(sync_to, token, dev_->term()));
     }
 
     // One-block data write at dlsn (write() CRCs the payload, so it needs a real buffer). commit_lsn is the
@@ -751,6 +757,34 @@ TEST_F(CraftAppendTest, NegativeSyncToRejected) {
 
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), std::make_error_condition(std::errc::invalid_argument));
+}
+
+// A caller validated term 1, then InternalLogin moved the session to 2: the round must fail rather than
+// adopt the new term, and must not claim the single-flight gate on its way out.
+TEST_F(CraftAppendTest, CallerTermReplacedByLoginIsRejected) {
+    dev_->seed_term(2);
+    dev_->seed_lsns(5, {3});
+
+    auto r = homeblocks::detail::sync_get(dev_->append(5, 0, /*term=*/1));
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
+    EXPECT_EQ(fetcher_.call_count, 0);
+    EXPECT_TRUE(proposer_.proposed.empty());
+    EXPECT_TRUE(do_append(5).has_value()); // the gate was never claimed: a current-session round proceeds
+}
+
+TEST_F(CraftPreResolutionTest, CallerTermReplacedByLoginIsRejected) {
+    dev_->set_peer_fetcher(&fetcher_);
+    dev_->seed_term(2);
+    dev_->seed_lsns(5, {3});
+
+    auto r = do_pre_resolve(5, /*term=*/1);
+
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(volume_error::STALE_TERM));
+    EXPECT_EQ(fetcher_.call_count, 0);
+    EXPECT_TRUE(dev_->is_missing(3));
 }
 
 // ── proposing ─────────────────────────────────────────────────────────────────
@@ -874,7 +908,7 @@ TEST_F(CraftAppendTest, ConcurrentAppendRejected) {
     std::optional< result< craft::resolution_result > > nested; // set inside on_commit
     auto const loopback = proposer_.on_commit;
     proposer_.on_commit = [&](sisl::blob const& h, sisl::blob const& k) {
-        nested = homeblocks::detail::sync_get(dev_->append(5, 0));
+        nested = homeblocks::detail::sync_get(dev_->append(5, 0, dev_->term()));
         loopback(h, k);
     };
 

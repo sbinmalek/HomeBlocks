@@ -36,6 +36,7 @@
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
 #include <iomgr/iomgr.hpp>
+#include <sisl/async/value_awaitable.hpp>
 
 #include "craft/craft_repl_dev.hpp"
 #include "home_blks_config.hpp"
@@ -89,6 +90,10 @@ class MockCraftQuorumPoller : public CraftPeerFetcher {
 public:
     std::vector< craft::lsn_pair > polled;
     std::atomic< int > poll_calls{0};
+    // When set, the first poll stays outstanding until the test completes poll_gate (a poll slower than
+    // the tick interval). Later polls return immediately, so overlapping rounds show up in poll_calls.
+    bool hold_first_poll{false};
+    sisl::async::value_awaitable< bool > poll_gate;
 
     async_result< craft::lsn_pair > get_rs_commit_lsn(uint64_t, bool) override { co_return craft::lsn_pair{}; }
     async_result< std::vector< JournalSlot > > fetch_data(const std::vector< int64_t >&, uint32_t) override {
@@ -98,7 +103,7 @@ public:
         co_return std::vector< QuorumSlotResponse >{QuorumSlotResponse{}};
     }
     async_result< std::vector< craft::lsn_pair > > poll_quorum_lsns(uint64_t, bool, uint32_t) override {
-        ++poll_calls;
+        if (++poll_calls == 1 && hold_first_poll) co_await poll_gate;
         co_return polled;
     }
 };
@@ -232,11 +237,33 @@ TEST_F(CraftWatchdogTest, FollowerStaleTickNeverPolls) {
     EXPECT_TRUE(proposer_.proposed.empty());
 }
 
-// N=5 needs self + 2 responders; one isn't enough to sync.
+// A poll slower than the tick interval: later stale ticks must not start overlapping rounds (each would hold
+// the device alive). Once the slow poll completes and its round ends, ticks start rounds again.
+TEST_F(CraftWatchdogTest, SlowPollDoesNotOverlapRounds) {
+    fetcher_.hold_first_poll = true;
+    arm_as_leader(7);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(900)); // several stale ticks while poll 1 is held
+    int const fired_while_held = dev_->watchdog_fire_count();
+    int const polls_while_held = fetcher_.poll_calls.load();
+
+    fetcher_.poll_gate.complete(true); // the held round resumes here and ends (no client commit: no proposal)
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    dev_.reset(); // the gate is always completed before teardown, so no round is left suspended
+
+    EXPECT_GE(fired_while_held, 2);
+    EXPECT_EQ(polls_while_held, 1);
+    EXPECT_GE(fetcher_.poll_calls.load(), 2); // the gate was released: later ticks poll again
+}
+
+// N=5 needs self + 2 responders; one isn't enough to sync. Everything else is set up so the round would
+// propose 5 (a complete local prefix and a client commit at 5): the missing quorum is the only reason
+// it doesn't.
 TEST_F(CraftWatchdogTest, StaleTickWithoutQuorumDoesNotPropose) {
     proposer_.members = 5;
+    dev_->seed_lsns(5, {});
     fetcher_.polled = {craft::lsn_pair{.commit_lsn = -1, .last_append_lsn = 8}};
-    arm_as_leader(7);
+    arm_as_leader(7, /*client_commit_lsn=*/5);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(620));
     dev_.reset();

@@ -348,8 +348,10 @@ public:
     // and login. Runs pre_resolve_slots(sync_to) first and never proposes
     // past a slot it could not resolve -- the proposed watermark is clamped to just below the first one,
     // and that achieved watermark is what comes back as resolved_upto, alongside every Empty verdict
-    // <= it (earlier rounds' included). At most one append() runs at a time
-    async_result< craft::resolution_result > append(int64_t sync_to, uint64_t client_token);
+    // <= it (earlier rounds' included). At most one append() runs at a time.
+    // term is the session term the caller validated; the round runs only within that session and fails
+    // with STALE_TERM if InternalLogin has moved state_.term past it.
+    async_result< craft::resolution_result > append(int64_t sync_to, uint64_t client_token, uint64_t term);
 
     // Return raw journal data for the requested LSNs. Empty slots return
     // JournalSlot{.is_empty=true} rather than an error.
@@ -587,7 +589,8 @@ private:
         std::vector< int64_t > empty_slots;
         std::vector< int64_t > unresolved;
     };
-    async_result< PreResolution > pre_resolve_slots(int64_t upto);
+    // term: the session the round belongs to (STALE_TERM if state_.term differs, at entry or later).
+    async_result< PreResolution > pre_resolve_slots(int64_t upto, uint64_t term);
 
     // Majority of member_count(). Requires raft_proposer_.
     uint32_t quorum_size() const { return raft_proposer_->member_count() / 2 + 1; }
@@ -726,8 +729,9 @@ private:
     uint32_t peer_fetch_timeout_ms_{5000};      // deadline for fetch_data; overridden via set_peer_fetch_timeout_ms()
     CraftRaftProposer* raft_proposer_{nullptr}; // null until S8 wires the volume's repl_dev
     std::atomic< bool > sync_in_flight_{false}; // single-flight gate for append()
-    int64_t last_proposed_sync_lsn_{-1};        // highest committed append() watermark (guarded by state_mu_)
-    int64_t last_periodic_sync_lsn_{-1};        // last_append_lsn at the last periodic trigger (guarded by state_mu_)
+    std::atomic< bool > watchdog_round_in_flight_{false}; // single-flight gate for a whole watchdog_sync() round
+    int64_t last_proposed_sync_lsn_{-1};                  // highest committed append() watermark (guarded by state_mu_)
+    int64_t last_periodic_sync_lsn_{-1}; // last_append_lsn at the last periodic trigger (guarded by state_mu_)
     // Highest commit_lsn the current session has piggybacked on write/read/keep_alive: the client's
     // resolved prefix, so nothing at or below it is still in flight.
     // Reset when InternalLogin starts a new session. Guarded by state_mu_.
