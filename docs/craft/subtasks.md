@@ -157,7 +157,7 @@ As an I/O engineer, I want `get_rs_commit_lsn()` / `get_lsns()` and `fetch_data(
 pull missing journal data during `SyncRSCommitLSN` apply.
 
 **Acceptance criteria:**
-- `get_lsns(vol_id)` / `get_rs_commit_lsn()` returns `{commit_lsn, last_append_lsn}` for the local partition
+- `get_lsns(vol_id)` returns `{commit_lsn, last_append_lsn}` for the local partition; `get_rs_commit_lsn(term, is_login)` returns `{term, commit_lsn, last_append_lsn}`. The request's `term` is the current session term to fence (`is_login=true` quiesces writes with term ≤ it first); the reply's `term` is the replica's own session term
 - `fetch_data(lsns)` reads raw journal data for the requested LSNs and returns it (without applying to state machine)
 - These are called server-to-server via `CraftConnector` (see S9); stub the transport for unit tests
 - `fetch_data` returns four-way per slot: present+data, **present+zero** (`all_zeros=true`, no data, applied as a range unmap), **omitted** (not-present-here), or `is_empty=true` — the last **only** for a slot the peer has *positively* marked Empty (via a prior verdict), never for one it merely lacks
@@ -176,7 +176,7 @@ term across the replica set.
 
 **Acceptance criteria:**
 - Implements the leader-side login sequence:
-  1. Broadcast `GetRSCommitLSN(is_login=true)` to all peers; each **quiesces prior-session writes** before replying (fencing barrier); collect `{commit_lsn, last_append_lsn}`
+  1. Broadcast `GetRSCommitLSN(is_login=true)` to all peers; each **quiesces prior-session writes** before replying (fencing barrier): old-term writes get `STALE_TERM`, including one already in flight when the poll arrives (its slot stays journaled, but the write is not acked); collect `{commit_lsn, last_append_lsn}`
   2. Compute `rs_commit_lsn` = max `last_append_lsn` over the leader and every member that replied before the poll timeout (not just the first quorum to reply), counting each member once; if the leader plus responders are not a majority, fail with `NO_QUORUM` (forced; no `commit_lsn` variant, see the watermark deep-dive in the wiki)
   3. Pre-resolve every unresolved slot ≤ `rs_commit_lsn`, including holes below the leader's own `last_append_lsn`: fetch each from any peer holding it, or record an `Empty` verdict when a quorum (leader included) lacks it. If any slot stays unresolved, the login fails before anything is proposed and the client retries
   4. Propose `SyncRSCommitLSN(rs_commit_lsn, client_token, empty_slots)` via RAFT, carrying step 3's `Empty` verdicts; wait for commit

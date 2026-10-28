@@ -172,17 +172,24 @@ HomeBlocks handler: `CraftReplDev::logout()`
 ### 7. GetRSCommitLSN (Broadcast, initiated by leader)
 
 ```
-Request:  { term: uint64, my_commit_lsn: int64, my_last_append_lsn: int64, is_login: bool }
+Request:  { term: uint64, is_login: bool }
 Response: { term: uint64, commit_lsn: int64, last_append_lsn: int64 }
 ```
 
 Leader polls peers for their LSN state before a `SyncRSCommitLSN` proposal (login and on timeout).
 `is_login=true` makes the peer **quiesce prior-session writes** before reporting `last_append` (the
-fencing barrier); watchdog/periodic polls carry `is_login=false` and never quiesce. Only `last_append`
+fencing barrier): they are rejected with `STALE_TERM`, and a write already in flight journals its slot
+but is not acked. Watchdog/periodic polls carry `is_login=false` and never quiesce. Only `last_append`
 feeds the watermark: login proposes `max(quorum.last_append)`, while a watchdog round caps that at the
 client's piggybacked `commit_lsn` because nothing is quiesced (see #9). The polled `commit_lsn` is a
 contiguity certificate that bounds the leader's hole-resolution window, seeds `all_committed_lsn`, and
 carries the reconfig promotion gate.
+
+The request's `term` is the current session term T. A login poll fences writes whose term is ≤ T: the
+request's term, not the peer's own, which may lag behind an `InternalLogin` it hasn't applied yet. The
+response's `term` is the peer's own session term; a responder already past T makes the leader abort the
+login with `STALE_TERM`. The leader counts itself locally rather than sending its own LSNs, and identifies
+each responder by the connection it sent the request on, so the response carries no peer id.
 
 HomeBlocks handler: `CraftReplDev::get_rs_commit_lsn()` / `get_lsns()`
 Dispatched by: `CraftConnector` (inter-node channel, non-RAFT)

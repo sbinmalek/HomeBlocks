@@ -133,8 +133,9 @@ back as a hole); non-empty `data` is a **data write** of exactly `len` bytes (si
 buffer). Both take a `dLSN` and merge by highest-`dLSN`-per-LBA. Does **not** apply to the LBA index;
 `hdr.commit_lsn` rides along and advances the contiguous commit frontier best-effort, in `dLSN` order
 (this is CRAFT's commit — piggybacked on the writes the client is already broadcasting). Rejected with
-`craft_error::STALE_TERM` if `hdr.term` != the session term, or `std::errc::invalid_argument` on
-misalignment. ACK fires on journal-append completion and **returns the achieved
+`craft_error::STALE_TERM` if `hdr.term` != the session term, or if the replica is quiesced for a login
+(a write already in flight when the quiesce begins still journals its slot, but is not acked), or
+`std::errc::invalid_argument` on misalignment. ACK fires on journal-append completion and **returns the achieved
 `{commit_lsn, last_append_lsn}`** — every CRAFT IO response piggybacks the watermarks, so any
 round-trip refreshes the client's per-member model (its reclaim floor and Missing-map recovery) without
 a separate `keep_alive`.
@@ -225,12 +226,18 @@ verbs and never cross the client wire, so no CRAFT server exposes them.
 ### `get_lsns` / `get_rs_commit_lsn`
 
 ```cpp
-async_result<lsn_pair> get_lsns();           // local snapshot of {commit_lsn, last_append_lsn}
-async_result<lsn_pair> get_rs_commit_lsn();  // alias; used by the login leader's GetRSCommitLSN broadcast
+struct rs_commit_lsn_reply { uint64_t term; int64_t commit_lsn; int64_t last_append_lsn; };
+
+async_result<lsn_pair> get_lsns();   // local snapshot of {commit_lsn, last_append_lsn}
+async_result<rs_commit_lsn_reply> get_rs_commit_lsn(uint64_t term, bool is_login);
 ```
 
-Peer-to-peer; not a client-facing free function. The login leader polls all replicas via
-`get_rs_commit_lsn` to compute `rs_commit_lsn = max(quorum.last_append_lsn)`.
+Peer-to-peer; not a client-facing free function. The leader polls every other member via
+`get_rs_commit_lsn` before proposing a `SyncRSCommitLSN`; at login it takes `rs_commit_lsn` as the max
+`last_append_lsn` over itself and every responder. `term` is the current session term T. With
+`is_login=true` the replica quiesces first, rejecting writes whose term is ≤ T; it fences the request's
+term rather than its own, which may lag. The reply's `term` is the replica's own session term, so the
+leader can abort with `STALE_TERM` if a responder is already past T.
 
 ### `truncate`
 
