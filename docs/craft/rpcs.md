@@ -30,7 +30,9 @@ client_hdr: { term: uint64, commit_lsn: int64, all_committed_lsn: int64 }
 - `term` — fences a stale writer (rejected `ETERM`); checked on **every** IO including KeepAlive, so a
   deposed client cannot even reset the liveness watchdog.
 - `commit_lsn` — advance the contiguous commit frontier toward this, best-effort, in dLSN order
-  (`-1` = don't advance). This is CRAFT's commit, piggybacked.
+  (`-1` = don't advance). This is CRAFT's commit, piggybacked. It is also the client's **resolved
+  prefix** (every slot ≤ it is quorum-acked or already `Empty`, so none is still in flight), which is
+  why it caps background `SyncRSCommitLSN` rounds (#9).
 - `all_committed_lsn` — set-wide min commit_lsn; floors journal reclaim (`-1` = unknown).
 
 **Addressing is byte-based:** `addr` / `len` are byte offset/length, block-aligned to the volume's
@@ -177,8 +179,10 @@ Response: { term: uint64, commit_lsn: int64, last_append_lsn: int64 }
 Leader polls peers for their LSN state before a `SyncRSCommitLSN` proposal (login and on timeout).
 `is_login=true` makes the peer **quiesce prior-session writes** before reporting `last_append` (the
 fencing barrier); watchdog/periodic polls carry `is_login=false` and never quiesce. Only `last_append`
-feeds the recovery watermark; `commit_lsn` is a contiguity certificate that bounds the leader's
-hole-resolution window, seeds `all_committed_lsn`, and carries the reconfig promotion gate.
+feeds the watermark: login proposes `max(quorum.last_append)`, while a watchdog round caps that at the
+client's piggybacked `commit_lsn` because nothing is quiesced (see #9). The polled `commit_lsn` is a
+contiguity certificate that bounds the leader's hole-resolution window, seeds `all_committed_lsn`, and
+carries the reconfig promotion gate.
 
 HomeBlocks handler: `CraftReplDev::get_rs_commit_lsn()` / `get_lsns()`
 Dispatched by: `CraftConnector` (inter-node channel, non-RAFT)
@@ -192,7 +196,8 @@ Request:  { lsns: [int64] }
 Response: { slots: [{ lsn: int64, is_empty: bool, all_zeros: bool, lba: uint64, len: uint32, data: bytes }] }
 ```
 
-Called when a replica discovers it is missing data for certain LSNs after a `SyncRSCommitLSN` entry.
+Called by the leader during pre-resolution (before proposing a `SyncRSCommitLSN`), and by a replica that is
+missing slots while applying one.
 **Four-way per slot:** `is_empty=false, all_zeros=false` carries `data`; `all_zeros=true` is a zero write
 (no data, applied as a range unmap); `is_empty=true` means the peer **positively** marked that slot
 `Empty` (leader-only verdict); a requested `lsn` **omitted** means *not-present-here*. A peer never
@@ -259,20 +264,30 @@ previously answered as one.
 
 - **Client plane** (a CRAFT client ↔ a replica: LOGIN / WRITE / READ / KEEPALIVE / LOGOUT / RESOLVE).
   Settled by the CRAFT-1 spike: a packed binary wire over TCP/io_uring, specified in
-  [craft_client/docs/wire.md](https://github.com/szmyd/craft_client) with opcodes **1–14** allocated and a
+  [craft_client/docs/wire.md](https://github.com/ebay/craft_client) with opcodes **1–14** allocated and a
   reference client + server that pass it end to end. `CraftConnector` terminates *this* wire.
-- **Peer plane** (a replica ↔ a replica: `GetRSCommitLSN` / `fetch_data` / `truncate`, driven as a side effect
-  of applying a `SyncRSCommitLSN` or `InternalLogin` RAFT entry). **Not specified.** No opcode is allocated for
-  it — `craft::wire::op` stops at 14 — so it is deferred at the *wire*, not merely at the transport. It need not
-  ride the same channel as the client plane: these calls are node-to-node, and HomeBlocks may prefer its existing
-  inter-node RPC. See `craft_client/docs/peer-plane.md` for the interface (`craft_peer`) and what remains.
-  Whatever it ends up being, it **must be timeout-bounded**: the catch-up call site
+- **Peer plane** (a replica ↔ a replica). Two calls:
+  - `GetRSCommitLSN` (#7): the leader polls the other members before it proposes a `SyncRSCommitLSN` (login
+    with `is_login=true`, the watchdog with `is_login=false`).
+  - `FetchData` (#8): the leader fetches unresolved slots during pre-resolution, before it proposes; a lagging
+    replica fetches its missing slots while applying a `SyncRSCommitLSN`.
+
+  Truncation is **not** a peer call: each replica truncates its own journal when it applies `InternalLogin`
+  (#10), and `SyncRSCommitLSN` apply never truncates.
+
+  craft_client allocates both on its wire -- `get_rs_commit_lsn` 17/18 and `fetch_data` 19/20 (15/16 is
+  `create_volume`, a bootstrap op) -- and its RAFT reference replica (`src/raft`) uses them through
+  `CraftTcpPeer` and `craft_tcp_server`. That op 17/18 carries less than #7: `{term, is_login}` →
+  `{commit_lsn, last_append_lsn}`. HomeBlocks has not picked a transport: it can ride that wire or its existing
+  inter-node RPC, since these calls are node-to-node. See `craft_client/docs/peer-plane.md` for the interface
+  (`craft_peer`). Whatever it ends up being, it **must be timeout-bounded**: the catch-up call site
   (`CraftPeerFetcher::fetch_data`, used by `SyncRSCommitLSN` apply) already carries a `timeout_ms`
   parameter (`peer_fetch_timeout_ms` in `home_blks_config.fbs`, default 5000ms) for the real transport to
   enforce — a peer that misses it is treated as unreachable, same as any other hard failure.
 
 Note the asymmetry this creates, because it is easy to get backwards: HomeBlocks is **both ends** of the peer
-plane (it initiates on RAFT commit *and* serves peers) but **only the far end** of the client plane (it never
+plane (it initiates as the leader before proposing and as a replica applying `SyncRSCommitLSN`, *and* serves
+peers) but **only the far end** of the client plane (it never
 builds a CRAFT client).
 
 Before that lands, the wire is exercised **entirely inside the `craft_client` package**, not here: its

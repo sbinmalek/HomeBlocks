@@ -177,17 +177,15 @@ term across the replica set.
 **Acceptance criteria:**
 - Implements the leader-side login sequence:
   1. Broadcast `GetRSCommitLSN(is_login=true)` to all peers; each **quiesces prior-session writes** before replying (fencing barrier); collect `{commit_lsn, last_append_lsn}`
-  2. Compute `rs_commit_lsn` = quorum's max `last_append_lsn` (forced; no `commit_lsn` variant, see the watermark deep-dive in the wiki)
-  3. If `self.last_append_lsn < rs_commit_lsn`: `fetch_data(missing)` from ahead peer, append to own journal
-  4. Propose `SyncRSCommitLSN(rs_commit_lsn)` via RAFT; wait for commit
-  5. Propose `InternalLogin(client_token, term+1)` via RAFT; wait for commit
-  6. Replicas with `last_append > rs_commit_lsn` receive `truncate(rs_commit_lsn)` call
-  7. Return `{members, dLSN=rs_commit_lsn, term=term+1}`
+  2. Compute `rs_commit_lsn` = max `last_append_lsn` over the leader and every member that replied before the poll timeout (not just the first quorum to reply), counting each member once; if the leader plus responders are not a majority, fail with `NO_QUORUM` (forced; no `commit_lsn` variant, see the watermark deep-dive in the wiki)
+  3. Pre-resolve every unresolved slot ≤ `rs_commit_lsn`, including holes below the leader's own `last_append_lsn`: fetch each from any peer holding it, or record an `Empty` verdict when a quorum (leader included) lacks it. If any slot stays unresolved, the login fails before anything is proposed and the client retries
+  4. Propose `SyncRSCommitLSN(rs_commit_lsn, client_token, empty_slots)` via RAFT, carrying step 3's `Empty` verdicts; wait for commit
+  5. Propose `InternalLogin(client_token, term+1, rs_commit_lsn)` via RAFT; wait for commit. Each replica with `last_append > rs_commit_lsn` truncates to `rs_commit_lsn` when it applies the entry, before adopting the new term (no truncate RPC; a replica that missed the login truncates when it applies the entry later)
+  6. Return `{members, dLSN=rs_commit_lsn, term=term+1}`
 - **Quiesce release:** if the login aborts (cannot reach quorum) the leader signals release, and replicas also time out the quiesce independently as a backstop, so a failed login cannot wedge the current owner
-- **Phase-1b fallback:** a slot ≤ `rs_commit_lsn` absent from the whole responding quorum was never quorum-durable and is marked `Empty`; if quorum is unreachable the login fails and the client retries
 - Returns `ENOTLEADER` if called on a follower
 - Login is serialized (only one in-flight login per partition at a time)
-- Integration test: 3-node mock cluster; login with divergent replica state; verify all replicas converge
+- Integration test: 3-node mock cluster; login with divergent replica state; verify the leader is at `commit_lsn == rs_commit_lsn` when login returns, and every member converges to it afterwards (including one that missed the login, once healed)
 
 ---
 

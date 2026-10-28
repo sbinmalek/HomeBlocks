@@ -109,12 +109,14 @@ struct LoginResult {
 async_result<LoginResult> login(volume_handle const& vol, uint64_t client_token);
 ```
 
-Orchestrates the full login sequence (GetRSCommitLSN broadcast → optional FetchData →
-`SyncRSCommitLSN` RAFT → `InternalLogin` RAFT) and returns once both RAFT entries commit. **A follower
+Orchestrates the full login sequence (GetRSCommitLSN broadcast → pre-resolution (FetchData / `Empty`
+verdicts) → `SyncRSCommitLSN` RAFT → `InternalLogin` RAFT) and returns once both entries have applied on
+the leader. **A follower
 returns LoginResult with `term==0` and `leader_hint` set to the current leader's id (not an error)**;
 the client finds the matching handle by id and retries login there. `NO_QUORUM` / `REPLICA_DOWN` are
-returned as errors. Postconditions: all quorum members have `commit_lsn == rs_commit_lsn`; all reject
-IO whose `term` != the new session term.
+returned as errors. Postconditions: the leader has `commit_lsn == rs_commit_lsn` and has adopted the new
+session term. Other members reach both as they apply the two entries, in the background; the client admits
+IO once a quorum accepts the new term and at least one member has `commit_lsn ≥ dLSN`.
 
 ---
 
