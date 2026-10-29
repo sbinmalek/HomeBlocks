@@ -102,7 +102,9 @@ struct LoginResult {
     std::vector<replica_endpoint> members;
     int64_t            dLSN;         // starting (per-partition) LSN for new IO
     uint64_t           term;         // 0 == NOT_LEADER redirect; >0 == session term
-    uint32_t           lba_size;     // block size in bytes: client aligns addr/len to it
+    uint32_t           lba_size;     // block size in bytes (the volume's page_size): client aligns addr/len to it
+    uint64_t           capacity;     // volume size in bytes (the volume's size_bytes): the device's size
+    uint32_t           max_tx;       // largest single IO payload in bytes; every member must accept it
     boost::uuids::uuid leader_hint;  // non-nil iff redirect (term==0); retry login there
 };
 

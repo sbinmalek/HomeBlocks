@@ -181,7 +181,7 @@ term across the replica set.
   3. Pre-resolve every unresolved slot ≤ `rs_commit_lsn`, including holes below the leader's own `last_append_lsn`: fetch each from any peer holding it, or record an `Empty` verdict when a quorum (leader included) lacks it. If any slot stays unresolved, the login fails before anything is proposed and the client retries
   4. Propose `SyncRSCommitLSN(rs_commit_lsn, client_token, empty_slots)` via RAFT, carrying step 3's `Empty` verdicts; wait for commit
   5. Propose `InternalLogin(client_token, term+1, rs_commit_lsn)` via RAFT; wait for commit. Each replica with `last_append > rs_commit_lsn` truncates to `rs_commit_lsn` when it applies the entry, before adopting the new term (no truncate RPC; a replica that missed the login truncates when it applies the entry later)
-  6. Return `{members, dLSN=rs_commit_lsn, term=term+1}`
+  6. Return `{members, dLSN=rs_commit_lsn, term=term+1}` plus the volume geometry `{lba_size, capacity, max_tx}`
 - **Quiesce release:** if the login aborts (cannot reach quorum) the leader signals release, and replicas also time out the quiesce independently as a backstop, so a failed login cannot wedge the current owner
 - Returns `ENOTLEADER` if called on a follower
 - Login is serialized (only one in-flight login per partition at a time)
@@ -219,9 +219,13 @@ the RPC layer and storage layer have a clean boundary with no storage logic in t
 
 **Acceptance criteria:**
 - `CraftConnector` class exists; transport is pluggable (CRAFT-1 spike determines final choice)
-- Client-facing handlers: `Login` (routes by the request's `volume_id`), `Write`, `Read`, `KeepAlive`,
+- Client-facing handlers: `Login` (routes by the request's `volume_id`), `Helo`, `Write`, `Read`, `KeepAlive`,
   `Resolve`, `Logout` (there is no `Commit` verb: the watermark rides on `client_hdr.commit_lsn`, see
   [rpcs.md](rpcs.md))
+- Per-connection session binding (CRAFT-on-HomeBlocks wiki, "Topology and session"): one connection runs `Login`,
+  and every other connection sends `Helo {volume_id, client_token, term}` to bind to the session. The connector
+  checks the term and token against `CraftReplDev`'s current session, binds the term to the connection, and stamps
+  that term into `client_hdr.term` on every op from it; `CraftReplDev` checks it per op
 - Server-to-server handlers: `GetRSCommitLSN`, `FetchData`, `GetLSNs` (used during login and resync)
 - Each handler translates wire types ↔ `CraftReplDev` types with no storage logic
 - Leader redirect: if a `Login` arrives at a follower, reply with a successful response carrying `term == 0`

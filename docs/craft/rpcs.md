@@ -46,7 +46,8 @@ client_hdr: { term: uint64, commit_lsn: int64, all_committed_lsn: int64 }
 
 ```
 Request:  { volume_id: uuid, client_token: uint64 }
-Response: { members: [endpoint], dLSN: int64, term: uint64, lba_size: uint32, leader_hint: id }
+Response: { members: [endpoint], dLSN: int64, term: uint64, lba_size: uint32, capacity: uint64,
+            max_tx: uint32, leader_hint: id }
 ```
 
 Client sends to the RAFT leader. A follower does **not** fail the call: it replies with a successful
@@ -58,7 +59,9 @@ RAFT) and responds once both RAFT entries commit. `volume_id` names the volume t
 on (the design's `login(client_token, vol_id)`): a multi-volume server routes by it, and it is the same
 id every follow-on connection presents in HELO (see the wire doc in `craft_client`). `dLSN` is the
 starting per-partition LSN. `lba_size` is the volume block size in bytes — the client aligns every
-addr/len to it and presents the geometry to the filesystem.
+addr/len to it and presents the geometry to the filesystem. `capacity` is the volume size in bytes and
+`max_tx` the largest single IO payload, so the device is self-describing over the wire
+(CRAFT-on-HomeBlocks wiki); every member must accept an IO of `max_tx` bytes.
 
 HomeBlocks handler: `CraftReplDev::login()`
 
@@ -269,10 +272,14 @@ committed `InternalLogin`.
 **The client plane is decided; the peer plane is not.** These are two different questions and they were
 previously answered as one.
 
-- **Client plane** (a CRAFT client ↔ a replica: LOGIN / WRITE / READ / KEEPALIVE / LOGOUT / RESOLVE).
+- **Client plane** (a CRAFT client ↔ a replica: LOGIN / HELO / WRITE / READ / KEEPALIVE / LOGOUT / RESOLVE).
   Settled by the CRAFT-1 spike: a packed binary wire over TCP/io_uring, specified in
   [craft_client/docs/wire.md](https://github.com/ebay/craft_client) with opcodes **1–14** allocated and a
-  reference client + server that pass it end to end. `CraftConnector` terminates *this* wire.
+  reference client + server that pass it end to end. `CraftConnector` terminates *this* wire. The session
+  term is bound per connection, not carried in each IO message (CRAFT-on-HomeBlocks wiki, "Topology and
+  session"): one connection runs LOGIN, and every other connection, including those to followers, sends
+  HELO `{volume_id, client_token, term}` to bind to the session. The replica fences each IO by its
+  connection's bound term; the connector stamps that term into `client_hdr.term`.
 - **Peer plane** (a replica ↔ a replica). Two calls:
   - `GetRSCommitLSN` (#7): the leader polls the other members before it proposes a `SyncRSCommitLSN` (login
     with `is_login=true`, the watchdog with `is_login=false`).
